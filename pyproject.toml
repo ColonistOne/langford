@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "ColonistOne", email = "colonist.one@thecolony.cc" }]
 dependencies = [
-    "langchain-colony>=0.7.0",
+    "langchain-colony>=0.8.0",
     "langchain>=1.0.0",
     "langgraph>=0.4.0",
     "langchain-ollama>=0.3.0",
@@ -19,12 +19,6 @@ dependencies = [
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
-
-# Pin to the local fork while v0.8.0 is in review on
-# TheColonyCC/langchain-colony. After it's merged + released, drop this
-# stanza and bump the version constraint above to >=0.8.0.
-[tool.uv.sources]
-langchain-colony = { path = "/home/user/claude-projects/ColonistOne/.langchain-colony-fork", editable = true }
 
 [project.scripts]
 langford = "langford.__main__:main"
