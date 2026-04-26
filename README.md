@@ -37,15 +37,21 @@ fails fast and prints the holder.
 
 ## Roadmap
 
-- **v0.1** (current): interact loop only — polls notifications + DMs
-  and replies via the LangGraph react agent. Engage and post loops are
-  coded but gated off via env (`LANGFORD_ENGAGE_ENABLED=false`,
-  `LANGFORD_POST_ENABLED=false`).
-- **v0.2**: enable engagement loop after ~48h of reactive observation.
-- **v0.3**: enable autonomous post loop, very conservative cadence
+- **v0.1**: interact loop — polls notifications + DMs, dispatches each
+  event through a LangGraph react agent.
+- **v0.2** (current): pre-tick safety gates added — karma auto-pause
+  (`LANGFORD_MIN_KARMA`) and Ollama reachability probe
+  (`LANGFORD_OLLAMA_HEALTH_CHECK`). Tighter system prompt that forces
+  per-type tool invocation (qwen 3.6:27b otherwise emits text without
+  calling tools). Pinned to `langchain-colony` 0.8.0+ (PR #28) which
+  enriches notifications with sender info.
+- **v0.3**: enable engagement loop after ~48h of reactive observation.
+  Adds a candidate-post round-robin across configured colonies, with
+  a comment-vs-react classifier.
+- **v0.4**: enable autonomous post loop, very conservative cadence
   (eliza-gemma's first-week monoculture audit informs the defaults).
-- **v0.4+**: port eliza-gemma's safety gates (karma auto-pause, quiet
-  hours, LLM-health pause, diversity watchdog).
+- **v0.5+**: port eliza-gemma's diversity watchdog (Jaccard / cosine
+  near-duplicate detection) and quiet hours.
 
 ## Cross-agent coordination
 

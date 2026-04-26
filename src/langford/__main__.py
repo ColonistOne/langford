@@ -19,6 +19,7 @@ import signal
 import sys
 from contextlib import suppress
 
+import httpx
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_colony import ColonyEventPoller, ColonyNotification, ColonyToolkit
@@ -27,62 +28,169 @@ from langchain_ollama import ChatOllama
 
 logger = logging.getLogger("langford")
 
+# Sentinel below any plausible karma value — disables the auto-pause
+# entirely. Negative because karma can legitimately be below 0.
+_KARMA_DISABLED = -10**6
+
 SYSTEM_PROMPT = """\
 You are Langford, an AI agent on The Colony (thecolony.cc) — a social
-network for AI agents and humans collaborating on findings, tools and
-research. You are a sibling to @eliza-gemma and serve as live dogfood
-for the langchain-colony Python package.
+network for AI agents and humans. You are a sibling to @eliza-gemma
+and serve as live dogfood for the langchain-colony Python package.
 
-Your stack is LangGraph + langchain-colony + local Ollama
-(qwen3.6:27b). When a notification reaches you, decide which tool(s)
-to use to respond appropriately.
+Stack: LangGraph + langchain-colony + local Ollama (qwen3.6:27b).
 
-Common cases:
-  * mention in a post / comment → leave a thoughtful comment on the
-    post (use ColonyCommentOnPost with the post_id from the
-    notification).
-  * reply to one of your comments → continue the thread with
-    ColonyCommentOnPost on the same post_id.
-  * vote / reaction / follow notifications → no action needed; ignore.
+When a notification arrives, you MUST take one of two actions:
+either invoke a Colony tool, or explicitly state "no action needed"
+and stop. Never emit a free-form reply text without calling a tool —
+the user only sees what your tools post on The Colony.
 
-Style: terse, technical, plain-spoken. No emoji unless the person
-you're replying to used one first. No hype, no "Great question!"
-opener, no marketing voice. Quote specific details when relevant. If
-you have nothing substantive to add, react with an emoji via
-ColonyReactToPost or ColonyReactToComment instead of posting empty
-filler.
+Required tool calls by notification_type:
+  * direct_message → CALL colony_send_message(
+      username=<sender_username from the notification>,
+      body=<your reply to the content>
+    ). Use the sender_username field, NOT the display name in the
+    notification text. The DM you're replying to is in the
+    "Content:" block.
+  * mention or reply → CALL colony_comment_on_post(
+      post_id=<post_id from the notification>,
+      body=<your reply>,
+      parent_comment_id=<comment_id if it's a reply, else omit>
+    ).
+  * vote / reaction / follow / award / tip_received → no action
+    needed; emit one short line saying so and stop.
+
+Response style: terse, technical, plain-spoken. No emoji unless the
+person you're replying to used one first. No hype, no "Great
+question!" opener, no marketing voice. Quote specific details when
+relevant. Aim for 1–3 sentences in DMs and short comments.
 
 Boundaries:
   * Never claim to be human.
   * Don't republish other users' content to third parties.
   * Don't follow or DM users you have no prior interaction with.
-  * If asked about your operator, say: "Operated by ColonistOne."
+  * If asked who runs you, say: "Operated by ColonistOne."
 """
 
 
 def _build_event_message(notif: ColonyNotification) -> HumanMessage:
-    """Turn a ColonyNotification into a HumanMessage for the agent."""
+    """Turn a ColonyNotification into a HumanMessage for the agent.
+
+    Uses the enriched fields (``sender_username``, ``body``) populated
+    by ``ColonyEventPoller(enrich=True)`` in langchain-colony 0.8.0+.
+    Falls back to the raw ``message`` text when enrichment didn't fire.
+    """
     parts = [f"Notification type: {notif.notification_type}"]
+    if notif.sender_username:
+        parts.append(f"Sender username: @{notif.sender_username}")
+    if notif.sender_display_name:
+        parts.append(f"Sender display name: {notif.sender_display_name}")
     if notif.post_id:
         parts.append(f"Post id: {notif.post_id}")
     if notif.comment_id:
         parts.append(f"Comment id: {notif.comment_id}")
-    if notif.message:
+    if notif.body:
         parts.append("")
-        parts.append(notif.message)
+        parts.append(f"Content:\n{notif.body}")
+    elif notif.message:
+        parts.append("")
+        parts.append(f"Notification text: {notif.message}")
     parts.append("")
     parts.append(
         "Decide whether to respond, and if so, use the appropriate "
         "Colony tool. If no response is warranted (e.g. vote, "
-        "reaction, follow), say so briefly and stop."
+        "reaction, follow), say so briefly and stop. For direct "
+        "messages, reply via colony_send_message using the sender "
+        "username above (NOT the display name)."
     )
     return HumanMessage(content="\n".join(parts))
 
 
+async def _check_safety_gates(
+    toolkit: ColonyToolkit,
+    ollama_url: str,
+    min_karma: int,
+    health_check: bool,
+) -> str | None:
+    """Pre-tick safety gates.
+
+    Returns ``None`` if it's safe to poll/dispatch this cycle, or a
+    short reason string if the tick should be skipped. The two gates:
+
+    * **Karma auto-pause** — if the agent's karma has dropped below
+      ``min_karma``, pause until it recovers (e.g. someone moderates
+      the offending content or upvotes the agent back into bounds).
+    * **Ollama health** — if the local LLM is unreachable, polling
+      makes no sense; we'd just dispatch into the void and lose the
+      notifications to ``mark_read`` on a failed cycle.
+
+    SDK errors during the karma check are not fatal — we proceed
+    rather than wedging the agent on a transient backend hiccup.
+    """
+    if min_karma > _KARMA_DISABLED:
+        try:
+            me = await asyncio.to_thread(toolkit.client.get_me)
+            karma = int(me.get("karma", 0))
+            if karma < min_karma:
+                return f"karma={karma} < min_karma={min_karma}"
+        except Exception as exc:
+            logger.warning("karma check failed (%s) — proceeding", exc)
+
+    if health_check:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{ollama_url.rstrip('/')}/api/tags")
+            if r.status_code != 200:
+                return f"ollama unhealthy (HTTP {r.status_code})"
+        except (httpx.HTTPError, OSError) as exc:
+            return f"ollama unreachable: {exc.__class__.__name__}"
+
+    return None
+
+
+async def _interact_loop(
+    poller: ColonyEventPoller,
+    toolkit: ColonyToolkit,
+    ollama_url: str,
+    poll_interval: int,
+    min_karma: int,
+    health_check: bool,
+    stop_event: asyncio.Event,
+) -> None:
+    """Custom polling loop with per-tick safety gates.
+
+    Replaces ``poller.run_async`` so we can inspect karma / Ollama
+    health BEFORE polling, and skip ticks (without consuming
+    notifications) when something's wrong.
+    """
+    paused_reason: str | None = None
+    logger.info("🔔 interact loop starting (poll every %ds)", poll_interval)
+
+    while not stop_event.is_set():
+        reason = await _check_safety_gates(toolkit, ollama_url, min_karma, health_check)
+        if reason is None:
+            if paused_reason is not None:
+                logger.info("▶️  gates clear (was paused: %s) — resuming", paused_reason)
+                paused_reason = None
+            try:
+                await poller.poll_once_async()
+            except Exception:
+                logger.exception("poll_once_async failed")
+        else:
+            if reason != paused_reason:
+                logger.warning("⏸️  paused: %s", reason)
+                paused_reason = reason
+
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+            if stop_event.is_set():
+                return
+
+
 async def _handle_event(agent, notif: ColonyNotification) -> None:
     logger.info(
-        "event type=%s post_id=%s comment_id=%s",
+        "event type=%s sender=@%s post_id=%s comment_id=%s",
         notif.notification_type,
+        notif.sender_username or "?",
         notif.post_id,
         notif.comment_id,
     )
@@ -115,6 +223,18 @@ async def main_async() -> None:
     interact_enabled = os.environ.get("LANGFORD_INTERACT_ENABLED", "true").lower() == "true"
     engage_enabled = os.environ.get("LANGFORD_ENGAGE_ENABLED", "false").lower() == "true"
     post_enabled = os.environ.get("LANGFORD_POST_ENABLED", "false").lower() == "true"
+
+    # Safety gates (v0.2). Pause the loop when karma drops below the
+    # threshold or Ollama is unreachable. Setting min_karma below the
+    # _KARMA_DISABLED sentinel disables the karma gate; setting the
+    # health-check env to "false" disables the Ollama probe.
+    min_karma_raw = os.environ.get("LANGFORD_MIN_KARMA", "-5")
+    try:
+        min_karma = int(min_karma_raw)
+    except ValueError:
+        logger.warning("LANGFORD_MIN_KARMA=%r is not an int — disabling karma gate", min_karma_raw)
+        min_karma = _KARMA_DISABLED
+    health_check = os.environ.get("LANGFORD_OLLAMA_HEALTH_CHECK", "true").lower() == "true"
 
     if engage_enabled or post_enabled:
         logger.warning(
@@ -168,17 +288,31 @@ async def main_async() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _shutdown)
 
-    logger.info("🔔 interact loop starting (poll every %ds)", poll_interval)
-    poller_task = asyncio.create_task(poller.run_async(poll_interval=poll_interval))
+    logger.info(
+        "safety gates: min_karma=%s, ollama_health_check=%s",
+        "disabled" if min_karma <= _KARMA_DISABLED else min_karma,
+        health_check,
+    )
+
+    loop_task = asyncio.create_task(
+        _interact_loop(
+            poller=poller,
+            toolkit=toolkit,
+            ollama_url=ollama_url,
+            poll_interval=poll_interval,
+            min_karma=min_karma,
+            health_check=health_check,
+            stop_event=stop_event,
+        )
+    )
 
     try:
         await stop_event.wait()
     finally:
-        logger.info("stopping poller")
-        poller.stop()
-        poller_task.cancel()
+        logger.info("stopping interact loop")
+        loop_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(poller_task, timeout=5)
+            await asyncio.wait_for(loop_task, timeout=5)
         logger.info("goodbye")
 
 
