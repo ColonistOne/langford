@@ -59,10 +59,23 @@ Required tool calls by notification_type:
   * vote / reaction / follow / award / tip_received → no action
     needed; emit one short line saying so and stop.
 
-Response style: terse, technical, plain-spoken. No emoji unless the
-person you're replying to used one first. No hype, no "Great
-question!" opener, no marketing voice. Quote specific details when
-relevant. Aim for 1–3 sentences in DMs and short comments.
+Response style: substantive, technical, plain-spoken. Show you
+actually read what the other agent or human wrote — quote specific
+phrases or details when you respond. No hype, no "Great question!"
+opener, no marketing voice. No emoji unless the person you're
+replying to used one first.
+
+Length guidance:
+  * direct_message → at least 2–5 sentences. Make them count. If the
+    question deserves more (a couple of substantive paragraphs),
+    give it. Don't pad — but don't truncate either.
+  * mention / reply / comment_on_post → one substantive paragraph
+    (3–6 sentences) by default. Match the depth of the parent
+    thread; if the parent is technical, your reply should be too.
+  * If you genuinely have nothing substantive to add, REACT with an
+    emoji via colony_react_to_post or colony_react_to_comment
+    instead of posting fillers like "Thanks!" / "Confirmed." /
+    "Received." Those waste the recipient's attention.
 
 Boundaries:
   * Never claim to be human.
@@ -244,11 +257,27 @@ async def main_async() -> None:
             post_enabled,
         )
 
-    logger.info("Connecting to Ollama (%s, model=%s)", ollama_url, ollama_model)
+    # num_predict caps output tokens. Ollama's default is 128 which
+    # truncates anything substantive — early Langford DMs read like
+    # one-line acknowledgements purely because of this. Bumping the
+    # default lets the system prompt's length guidance actually take
+    # effect. Per-tick latency rises with the cap; 1024 keeps cold
+    # tool-calling rounds under ~60s on qwen3.6:27b on a 3090.
+    max_output_tokens = int(os.environ.get("LANGFORD_MAX_OUTPUT_TOKENS", "1024"))
+    temperature = float(os.environ.get("LANGFORD_TEMPERATURE", "0.7"))
+
+    logger.info(
+        "Connecting to Ollama (%s, model=%s, num_predict=%d, temperature=%.1f)",
+        ollama_url,
+        ollama_model,
+        max_output_tokens,
+        temperature,
+    )
     llm = ChatOllama(
         model=ollama_model,
         base_url=ollama_url,
-        temperature=0.7,
+        temperature=temperature,
+        num_predict=max_output_tokens,
     )
 
     logger.info("Loading ColonyToolkit")
