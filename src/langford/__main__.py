@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+from pathlib import Path
 from langchain.agents import create_agent
 from langchain_colony import ColonyEventPoller, ColonyNotification, ColonyToolkit
 from langchain_core.messages import HumanMessage
@@ -78,6 +79,19 @@ Length guidance:
     emoji via colony_react_to_post or colony_react_to_comment
     instead of posting fillers like "Thanks!" / "Confirmed." /
     "Received." Those waste the recipient's attention.
+
+Tool-error rule (CRITICAL — must follow on every tool call):
+  * If a Colony tool returns an error string, you MUST do exactly one
+    of: (a) call the same tool again with corrected arguments, or
+    (b) end with a final message that explicitly says the action
+    FAILED, naming the tool and the error.
+  * Never claim a tool succeeded if its API call returned an error.
+    "Reacted" / "Posted" / "Sent" without an immediately-preceding
+    successful tool call is a hallucination and is forbidden.
+  * Example failure modes: emoji-key vs emoji-char (the API keys
+    are: thumbs_up, heart, laugh, thinking, fire, eyes, rocket,
+    clap — NOT '👍' / '❤️'); username with leading '@' may 404.
+    On any such error, retry with corrected args before giving up.
 
 Boundaries:
   * Never claim to be human.
@@ -277,6 +291,7 @@ async def _engage_tick(
     seen_ids: set[str],
     rr_index: list[int],
     candidate_limit: int,
+    seen_file: Path | None,
 ) -> None:
     """One engagement tick — round-robin colonies, pick a candidate, dispatch."""
     n = len(colonies)
@@ -309,6 +324,15 @@ async def _engage_tick(
         # Got one — advance round-robin past this colony for the next tick.
         rr_index[0] = (rr_index[0] + offset + 1) % n
         seen_ids.add(candidate["id"])
+        # Persist the seen post id so the next process-restart doesn't
+        # pick the same candidate. Append-only; failures are logged
+        # but never block dispatch.
+        if seen_file is not None:
+            try:
+                with seen_file.open("a", encoding="utf-8") as f:
+                    f.write(candidate["id"] + "\n")
+            except OSError as exc:
+                logger.warning("failed to persist seen post id: %s", exc)
         comments_data = {}
         try:
             comments_data = await asyncio.to_thread(toolkit.client.get_comments, candidate["id"])
@@ -353,16 +377,26 @@ async def _engage_loop(
     interval_min: int,
     interval_max: int,
     candidate_limit: int,
+    seen_file: Path | None,
     stop_event: asyncio.Event,
 ) -> None:
     """Long-running engagement tick driver.
 
     Wakes on a uniform-random interval in [interval_min, interval_max]
-    seconds. Tracks already-seen posts per process — restart re-seeds
-    the pool, which is fine: we'd rather re-evaluate a known post once
-    in a while than miss a worthy candidate after a bounce.
+    seconds. Tracks already-seen posts in a persistent file
+    (``LANGFORD_SEEN_POSTS_FILE``, default ``.engaged-posts.txt``) so a
+    restart doesn't pick the same candidate again — without
+    persistence every wakeup picked the first unseen post in
+    ``colonies[0]``, which under the supervisor pattern was the same
+    post each time.
     """
     seen_ids: set[str] = set()
+    if seen_file is not None and seen_file.exists():
+        try:
+            seen_ids = {line.strip() for line in seen_file.read_text().splitlines() if line.strip()}
+            logger.info("loaded %d seen post ids from %s", len(seen_ids), seen_file)
+        except OSError as exc:
+            logger.warning("failed to load seen file: %s", exc)
     rr_index: list[int] = [0]
     my_id = me.get("id") or ""
     logger.info(
@@ -387,6 +421,7 @@ async def _engage_loop(
                 seen_ids=seen_ids,
                 rr_index=rr_index,
                 candidate_limit=candidate_limit,
+                seen_file=seen_file,
             )
         except Exception:
             logger.exception("engage tick failed at top level")
@@ -458,12 +493,15 @@ async def main_async() -> None:
     # reactive loop behave for a while.
     engage_colonies = [
         s.strip()
-        for s in os.environ.get("LANGFORD_ENGAGE_COLONIES", "findings,builds").split(",")
+        for s in os.environ.get("LANGFORD_ENGAGE_COLONIES", "findings,meta,builds,general").split(",")
         if s.strip()
     ]
     engage_interval_min = int(os.environ.get("LANGFORD_ENGAGE_INTERVAL_MIN_SEC", "900"))
     engage_interval_max = int(os.environ.get("LANGFORD_ENGAGE_INTERVAL_MAX_SEC", "2700"))
     engage_candidate_limit = int(os.environ.get("LANGFORD_ENGAGE_CANDIDATE_LIMIT", "10"))
+    seen_posts_file = Path(
+        os.environ.get("LANGFORD_SEEN_POSTS_FILE", ".engaged-posts.txt")
+    ).expanduser()
 
     # num_predict caps output tokens. Ollama's default is 128 which
     # truncates anything substantive — early Langford DMs read like
@@ -560,6 +598,7 @@ async def main_async() -> None:
                         interval_min=engage_interval_min,
                         interval_max=engage_interval_max,
                         candidate_limit=engage_candidate_limit,
+                        seen_file=seen_posts_file,
                         stop_event=stop_event,
                     ),
                     name="engage-loop",
