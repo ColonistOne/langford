@@ -15,9 +15,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import signal
 import sys
 from contextlib import suppress
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -215,6 +217,186 @@ async def _interact_loop(
                 return
 
 
+def _build_engage_message(post: dict, comments: list[dict]) -> HumanMessage:
+    """Frame an engagement candidate for the agent.
+
+    Hands the model a single candidate post + its top comments and
+    asks for one of three actions: comment, react, or skip. Constrains
+    tool choice without restricting the toolkit; the rest of the system
+    prompt's length / honesty rules still apply.
+    """
+    author = (post.get("author") or {}).get("username") or "?"
+    title = post.get("title") or ""
+    body = (post.get("body") or "")[:1500]
+    pid = post.get("id") or ""
+    parts = [
+        "Engagement task: a fresh post has appeared in a colony you watch. Decide whether to engage.",
+        "",
+        f"Post id: {pid}",
+        f"Author: @{author}",
+        f"Title: {title}",
+        "",
+        "Body:",
+        body,
+    ]
+    if comments:
+        parts.append("")
+        parts.append("Recent top-level comments (latest first):")
+        for c in comments[:5]:
+            cu = (c.get("author") or {}).get("username") or "?"
+            cb = (c.get("body") or "").replace("\n", " ")[:240]
+            parts.append(f"  @{cu}: {cb}")
+    parts.extend(
+        [
+            "",
+            "Pick ONE action and stop:",
+            "  * If the post is technically interesting and you have something genuinely "
+            "substantive to add (a counter-point, a related observation, a concrete data "
+            "point from your own work) — CALL colony_comment_on_post(post_id, body=<your "
+            "paragraph>) and stop.",
+            "  * If the post is interesting but you don't have a substantive comment ready, "
+            "or you broadly agree without anything novel to add — CALL colony_react_to_post"
+            "(post_id, emoji=<one of: thumbs_up, heart, laugh, thinking, fire, eyes, rocket, "
+            "clap>) and stop.",
+            "  * If the post is off-topic, low quality, already saturated with comments, "
+            "or you have nothing to add even as a reaction — say 'skip' and stop. Do NOT "
+            "call any other tool.",
+            "",
+            "Do not create a new post. Do not vote. Do not follow the author. Do not DM. "
+            "One action per task.",
+        ]
+    )
+    return HumanMessage(content="\n".join(parts))
+
+
+async def _engage_tick(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    colonies: list[str],
+    my_id: str,
+    seen_ids: set[str],
+    rr_index: list[int],
+    candidate_limit: int,
+) -> None:
+    """One engagement tick — round-robin colonies, pick a candidate, dispatch."""
+    n = len(colonies)
+    if n == 0:
+        return
+    # Walk colonies starting at rr_index, wrap once.
+    for offset in range(n):
+        slug = colonies[(rr_index[0] + offset) % n]
+        try:
+            data = await asyncio.to_thread(
+                toolkit.client.get_posts, colony=slug, limit=candidate_limit
+            )
+        except Exception as exc:
+            logger.warning("engage: get_posts(%s) failed: %s", slug, exc)
+            continue
+        items = data if isinstance(data, list) else (data.get("items") or data.get("posts") or [])
+        candidate = None
+        for post in items:
+            pid = post.get("id")
+            if not pid or pid in seen_ids:
+                continue
+            if (post.get("author") or {}).get("id") == my_id:
+                continue
+            if post.get("is_locked") or post.get("is_deleted"):
+                continue
+            candidate = post
+            break
+        if candidate is None:
+            continue
+        # Got one — advance round-robin past this colony for the next tick.
+        rr_index[0] = (rr_index[0] + offset + 1) % n
+        seen_ids.add(candidate["id"])
+        comments_data = {}
+        try:
+            comments_data = await asyncio.to_thread(toolkit.client.get_comments, candidate["id"])
+        except Exception as exc:
+            logger.debug("engage: get_comments failed: %s", exc)
+        comments = (
+            comments_data
+            if isinstance(comments_data, list)
+            else (comments_data.get("items") or comments_data.get("comments") or [])
+        )
+        author = (candidate.get("author") or {}).get("username", "?")
+        logger.info(
+            "engage tick: c/%s post=%s by=@%s comments=%d",
+            slug,
+            candidate["id"][:8],
+            author,
+            len(comments),
+        )
+        try:
+            result = await agent.ainvoke(
+                {"messages": [_build_engage_message(candidate, comments)]}
+            )
+            final = result["messages"][-1]
+            logger.info(
+                "engage finished: %s",
+                str(final.content)[:240].replace("\n", " "),
+            )
+        except Exception:
+            logger.exception("engage handler failed")
+        return
+    logger.info(
+        "engage tick: no eligible candidates across %d colonies (already seen everything)",
+        n,
+    )
+
+
+async def _engage_loop(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    colonies: list[str],
+    interval_min: int,
+    interval_max: int,
+    candidate_limit: int,
+    stop_event: asyncio.Event,
+) -> None:
+    """Long-running engagement tick driver.
+
+    Wakes on a uniform-random interval in [interval_min, interval_max]
+    seconds. Tracks already-seen posts per process — restart re-seeds
+    the pool, which is fine: we'd rather re-evaluate a known post once
+    in a while than miss a worthy candidate after a bounce.
+    """
+    seen_ids: set[str] = set()
+    rr_index: list[int] = [0]
+    my_id = me.get("id") or ""
+    logger.info(
+        "🌐 engagement loop starting (interval %d-%ds, colonies=%s, my_id=%s)",
+        interval_min,
+        interval_max,
+        ",".join(colonies),
+        my_id[:8] or "?",
+    )
+    # Fire the first tick promptly — under the supervisor pattern,
+    # Langford's process lifetime per scheduled wakeup is short
+    # (~5-10 min minimum window), and a 15-45 min initial sleep would
+    # mean engagement never actually runs. Subsequent ticks back off
+    # to the configured cadence.
+    while not stop_event.is_set():
+        try:
+            await _engage_tick(
+                agent=agent,
+                toolkit=toolkit,
+                colonies=colonies,
+                my_id=my_id,
+                seen_ids=seen_ids,
+                rr_index=rr_index,
+                candidate_limit=candidate_limit,
+            )
+        except Exception:
+            logger.exception("engage tick failed at top level")
+        delay = random.uniform(interval_min, interval_max)
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            if stop_event.is_set():
+                return
+
+
 async def _handle_event(agent, notif: ColonyNotification) -> None:
     logger.info(
         "event type=%s sender=@%s post_id=%s comment_id=%s",
@@ -265,13 +447,23 @@ async def main_async() -> None:
         min_karma = _KARMA_DISABLED
     health_check = os.environ.get("LANGFORD_OLLAMA_HEALTH_CHECK", "true").lower() == "true"
 
-    if engage_enabled or post_enabled:
+    if post_enabled:
         logger.warning(
-            "LANGFORD_ENGAGE_ENABLED=%s POST_ENABLED=%s — but those loops "
-            "are not implemented in v0.1; ignoring.",
-            engage_enabled,
-            post_enabled,
+            "LANGFORD_POST_ENABLED=true — but the post loop is not "
+            "implemented yet (v0.4 scope); ignoring."
         )
+
+    # Engagement loop config (v0.3). Disabled by default; flip
+    # LANGFORD_ENGAGE_ENABLED=true in .env once you've watched the
+    # reactive loop behave for a while.
+    engage_colonies = [
+        s.strip()
+        for s in os.environ.get("LANGFORD_ENGAGE_COLONIES", "findings,builds").split(",")
+        if s.strip()
+    ]
+    engage_interval_min = int(os.environ.get("LANGFORD_ENGAGE_INTERVAL_MIN_SEC", "900"))
+    engage_interval_max = int(os.environ.get("LANGFORD_ENGAGE_INTERVAL_MAX_SEC", "2700"))
+    engage_candidate_limit = int(os.environ.get("LANGFORD_ENGAGE_CANDIDATE_LIMIT", "10"))
 
     # num_predict caps output tokens. Ollama's default is 128 which
     # truncates anything substantive — early Langford DMs read like
@@ -339,25 +531,50 @@ async def main_async() -> None:
         health_check,
     )
 
-    loop_task = asyncio.create_task(
-        _interact_loop(
-            poller=poller,
-            toolkit=toolkit,
-            ollama_url=ollama_url,
-            poll_interval=poll_interval,
-            min_karma=min_karma,
-            health_check=health_check,
-            stop_event=stop_event,
+    tasks: list[asyncio.Task] = [
+        asyncio.create_task(
+            _interact_loop(
+                poller=poller,
+                toolkit=toolkit,
+                ollama_url=ollama_url,
+                poll_interval=poll_interval,
+                min_karma=min_karma,
+                health_check=health_check,
+                stop_event=stop_event,
+            ),
+            name="interact-loop",
         )
-    )
+    ]
+
+    if engage_enabled:
+        if not engage_colonies:
+            logger.warning("LANGFORD_ENGAGE_ENABLED=true but LANGFORD_ENGAGE_COLONIES is empty")
+        else:
+            tasks.append(
+                asyncio.create_task(
+                    _engage_loop(
+                        agent=agent,
+                        toolkit=toolkit,
+                        me=me,
+                        colonies=engage_colonies,
+                        interval_min=engage_interval_min,
+                        interval_max=engage_interval_max,
+                        candidate_limit=engage_candidate_limit,
+                        stop_event=stop_event,
+                    ),
+                    name="engage-loop",
+                )
+            )
 
     try:
         await stop_event.wait()
     finally:
-        logger.info("stopping interact loop")
-        loop_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(loop_task, timeout=5)
+        logger.info("stopping loops")
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(t, timeout=5)
         logger.info("goodbye")
 
 
