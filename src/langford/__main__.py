@@ -35,6 +35,59 @@ logger = logging.getLogger("langford")
 # entirely. Negative because karma can legitimately be below 0.
 _KARMA_DISABLED = -10**6
 
+
+def _is_transient_ollama_error(exc: BaseException) -> bool:
+    """Match Ollama errors that warrant a retry rather than giving up.
+
+    The dominant case under the supervisor pattern: Langford boots
+    moments after Eliza is killed, but Ollama still has the prior
+    agent's model in VRAM (default keep_alive=5 min). The first chat
+    request triggers a CUDA OOM as Ollama tries to load qwen on top of
+    gemma. Waiting ~30-60s lets keep-alive expire (or the supervisor's
+    explicit unload to land), after which the retry succeeds.
+    """
+    msg = str(exc).lower()
+    if "model failed to load" in msg:
+        return True
+    if "out of memory" in msg and ("cuda" in msg or "gpu" in msg):
+        return True
+    return False
+
+
+async def _invoke_agent_with_retry(
+    agent: Any,
+    payload: dict,
+    *,
+    max_attempts: int = 3,
+    backoff_base: float = 30.0,
+) -> Any:
+    """Call ``agent.ainvoke`` with bounded retries on transient Ollama errors.
+
+    Non-transient exceptions propagate immediately. Each retry sleep is
+    a plain ``asyncio.sleep`` so it cancels cleanly on task cancellation
+    during shutdown.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await agent.ainvoke(payload)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_ollama_error(exc) or attempt >= max_attempts:
+                raise
+            delay = backoff_base * (2 ** (attempt - 1))
+            logger.warning(
+                "agent invoke: transient ollama error (%s) — retry %d/%d in %ds: %s",
+                exc.__class__.__name__,
+                attempt,
+                max_attempts,
+                int(delay),
+                str(exc)[:160],
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None  # unreachable
+    raise last_exc
+
 SYSTEM_PROMPT = """\
 You are Langford, an AI agent on The Colony (thecolony.cc) — a social
 network for AI agents and humans. You are a sibling to @eliza-gemma
@@ -42,10 +95,14 @@ and serve as live dogfood for the langchain-colony Python package.
 
 Stack: LangGraph + langchain-colony + local Ollama (qwen3.6:27b).
 
-When a notification arrives, you MUST take one of two actions:
-either invoke a Colony tool, or explicitly state "no action needed"
-and stop. Never emit a free-form reply text without calling a tool —
-the user only sees what your tools post on The Colony.
+When a notification arrives, you MUST take exactly one of two actions:
+either invoke a Colony tool, or output the EXACT text `no action needed`
+as your final message and stop. There are no other options. An empty
+final message, or a final message that is neither a tool call nor
+literally `no action needed`, is a behavioural violation — the
+notification goes unhandled and the user has no record of what you
+decided. The user only sees what your tools post on The Colony, so a
+silent dropout is indistinguishable from a crash.
 
 Required tool calls by notification_type:
   * direct_message → CALL colony_send_message(
@@ -263,7 +320,7 @@ def _build_engage_message(post: dict, comments: list[dict]) -> HumanMessage:
     parts.extend(
         [
             "",
-            "Pick ONE action and stop:",
+            "Pick ONE action and stop. THIS IS A ONE-SHOT TASK:",
             "  * If the post is technically interesting and you have something genuinely "
             "substantive to add (a counter-point, a related observation, a concrete data "
             "point from your own work) — CALL colony_comment_on_post(post_id, body=<your "
@@ -276,8 +333,14 @@ def _build_engage_message(post: dict, comments: list[dict]) -> HumanMessage:
             "or you have nothing to add even as a reaction — say 'skip' and stop. Do NOT "
             "call any other tool.",
             "",
-            "Do not create a new post. Do not vote. Do not follow the author. Do not DM. "
-            "One action per task.",
+            "CRITICAL — one action means ONE: after you call colony_comment_on_post OR "
+            "colony_react_to_post, the engage task is COMPLETE. Do not call a second tool. "
+            "If you reacted, do not also comment. If you commented, do not also react. "
+            "A reaction-then-comment sequence is the most common violation; resist it. "
+            "The system observes your tool-call sequence and counts a second call as a "
+            "hallucinated extra action.",
+            "",
+            "Do not create a new post. Do not vote. Do not follow the author. Do not DM.",
         ]
     )
     return HumanMessage(content="\n".join(parts))
@@ -352,8 +415,9 @@ async def _engage_tick(
             len(comments),
         )
         try:
-            result = await agent.ainvoke(
-                {"messages": [_build_engage_message(candidate, comments)]}
+            result = await _invoke_agent_with_retry(
+                agent,
+                {"messages": [_build_engage_message(candidate, comments)]},
             )
             final = result["messages"][-1]
             logger.info(
@@ -397,10 +461,17 @@ async def _engage_loop(
             logger.info("loaded %d seen post ids from %s", len(seen_ids), seen_file)
         except OSError as exc:
             logger.warning("failed to load seen file: %s", exc)
+    # Shuffle the colonies list per-session. Without this, every supervisor
+    # restart resets rr_index to 0 and the first engage tick of each window
+    # always starts at colonies[0]; with windows ~20-30 min and engage
+    # interval 15-45 min, only one tick fires per window — so colonies[0]
+    # gets the first slot disproportionately often, defeating round-robin.
+    colonies = list(colonies)
+    random.shuffle(colonies)
     rr_index: list[int] = [0]
     my_id = me.get("id") or ""
     logger.info(
-        "🌐 engagement loop starting (interval %d-%ds, colonies=%s, my_id=%s)",
+        "🌐 engagement loop starting (interval %d-%ds, colonies=%s [shuffled per-session], my_id=%s)",
         interval_min,
         interval_max,
         ",".join(colonies),
@@ -441,7 +512,9 @@ async def _handle_event(agent, notif: ColonyNotification) -> None:
         notif.comment_id,
     )
     try:
-        result = await agent.ainvoke({"messages": [_build_event_message(notif)]})
+        result = await _invoke_agent_with_retry(
+            agent, {"messages": [_build_event_message(notif)]}
+        )
         final = result["messages"][-1]
         logger.info("agent finished: %s", str(final.content)[:240].replace("\n", " "))
     except Exception:
