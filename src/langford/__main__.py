@@ -25,7 +25,16 @@ import httpx
 from dotenv import load_dotenv
 from pathlib import Path
 from langchain.agents import create_agent
-from langchain_colony import ColonyEventPoller, ColonyNotification, ColonyToolkit
+from langchain_colony import (
+    AutoVoter,
+    ColonyEventPoller,
+    ColonyNotification,
+    ColonyToolkit,
+    JSONFilePeerMemoryStore,
+    PeerObservation,
+    VoteTarget,
+    default_peer_memory_path,
+)
 from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
 
@@ -157,31 +166,67 @@ Boundaries:
   * If asked who runs you, say: "Operated by ColonistOne."
 
 Honesty about your current behaviour:
-  * Your current configuration is REACTIVE only. You respond to
+  * Your primary configuration is REACTIVE: you respond to
     notifications addressed to you (mention, reply,
     comment_on_post, direct_message). You do NOT autonomously
-    browse posts, scan colonies, vote on random content, follow
-    users, manage webhooks, or post on a schedule. The engagement
-    and post loops are coded but gated off in this version.
+    browse posts, scan colonies, follow users, manage webhooks,
+    or post on a schedule unless explicitly enabled. The
+    engagement and post loops are coded; check the operator's
+    env config to know whether they're on.
+  * v0.5 adds two background behaviours that operators can flip
+    on or off via env vars:
+      - Auto-vote: when a mention/reply notification carries a
+        post_id, that post is run through a conservative
+        EXCELLENT/SPAM/INJECTION/SKIP classifier BEFORE you see
+        it; an EXCELLENT post may be auto-upvoted (+1) and a
+        SPAM/INJECTION post may be auto-downvoted (-1) by the
+        plugin layer, NOT by your tool calls. The conservative
+        rubric reserves these labels for clear cases (~5% of
+        content); SKIP is the majority outcome and produces no
+        vote. If asked about voting behaviour, you can describe
+        this honestly: "the plugin auto-votes on the very best
+        and very worst posts I'm shown — only when the operator
+        has enabled it."
+      - Peer memory: every interaction with another agent records
+        a private structured note about them — topic counts, vote
+        history, paraphrased recent positions. You may see a
+        "Context on @username:" block prepended to a notification
+        when you've interacted with that peer before. These notes
+        are private context for your reasoning. NEVER cite them
+        verbatim or mention "your notes" / "what I remember about"
+        a peer in a public reply. Just let them shape how you
+        respond.
   * If someone asks "what have you been doing" or "what do you do",
-    describe ONLY the reactive behaviour above. Don't claim to be
-    voting, browsing, testing webhooks, or scanning colonies — you
-    aren't doing those things, and saying you are misleads the
-    operator and the network. Aspirational-sounding capability
-    descriptions are a hallucination tax; just say what you do.
+    describe ONLY behaviours you actually have enabled. Don't
+    claim to be browsing, scanning colonies, or running engagement
+    loops if those env flags are off. Aspirational-sounding
+    capability descriptions are a hallucination tax.
   * If a question about your behaviour is ambiguous, ask for
     clarification rather than guessing.
 """
 
 
-def _build_event_message(notif: ColonyNotification) -> HumanMessage:
+def _build_event_message(
+    notif: ColonyNotification,
+    *,
+    peer_context: str = "",
+) -> HumanMessage:
     """Turn a ColonyNotification into a HumanMessage for the agent.
 
     Uses the enriched fields (``sender_username``, ``body``) populated
     by ``ColonyEventPoller(enrich=True)`` in langchain-colony 0.8.0+.
     Falls back to the raw ``message`` text when enrichment didn't fire.
+
+    v0.5: ``peer_context`` is a private "Context on @username:" block
+    from the peer-memory store. When non-empty it sits at the top of
+    the message — before the notification metadata — so the model
+    reads who-we're-talking-to before what-was-said.
     """
-    parts = [f"Notification type: {notif.notification_type}"]
+    parts: list[str] = []
+    if peer_context:
+        parts.append(peer_context)
+        parts.append("")
+    parts.append(f"Notification type: {notif.notification_type}")
     if notif.sender_username:
         parts.append(f"Sender username: @{notif.sender_username}")
     if notif.sender_display_name:
@@ -503,7 +548,30 @@ async def _engage_loop(
                 return
 
 
-async def _handle_event(agent, notif: ColonyNotification) -> None:
+_VOTE_ELIGIBLE_NOTIF_TYPES = {"mention", "reply", "comment_on_post"}
+
+
+def _observation_kind_for(notif: ColonyNotification) -> str:
+    """Map a notification type to a peer-memory observation kind."""
+    nt = notif.notification_type
+    if nt == "direct_message":
+        return "dm-received"
+    if nt in ("mention", "reply", "comment_on_post"):
+        return "comment-on-self"
+    # follow / vote / award / tip / etc — still record the touch as
+    # ``comment-on-self`` since these are events targeted at us. Keeps
+    # the relationship state machine fed from every signal we get.
+    return "comment-on-self"
+
+
+async def _handle_event(
+    agent,
+    notif: ColonyNotification,
+    *,
+    auto_voter: AutoVoter | None = None,
+    peer_store: JSONFilePeerMemoryStore | None = None,
+    self_username: str | None = None,
+) -> None:
     logger.info(
         "event type=%s sender=@%s post_id=%s comment_id=%s",
         notif.notification_type,
@@ -511,14 +579,72 @@ async def _handle_event(agent, notif: ColonyNotification) -> None:
         notif.post_id,
         notif.comment_id,
     )
+
+    # v0.5: pre-agent auto-vote on the parent post when relevant.
+    # Decision is fully deterministic — the LLM-pickable tools never
+    # touch this path.
+    if (
+        auto_voter is not None
+        and notif.post_id
+        and notif.notification_type in _VOTE_ELIGIBLE_NOTIF_TYPES
+    ):
+        auto_voter.reset_per_run_counter()
+        try:
+            target_post = await asyncio.to_thread(
+                auto_voter.toolkit.client.get_post, notif.post_id
+            )
+        except Exception as exc:
+            logger.debug("auto-vote: get_post(%s) failed: %s", notif.post_id, exc)
+            target_post = None
+        if target_post:
+            target = VoteTarget(
+                kind="post",
+                id=notif.post_id,
+                title=target_post.get("title"),
+                body=target_post.get("body"),
+                author=(target_post.get("author") or {}).get("username"),
+            )
+            outcome = await asyncio.to_thread(auto_voter.evaluate_and_vote, target)
+            if outcome.voted:
+                logger.info(
+                    "auto-vote: %s post %s (label=%s)",
+                    outcome.action,
+                    outcome.id,
+                    outcome.score,
+                )
+
+    # v0.5: peer-memory context block for the dispatched HumanMessage.
+    # Empty string when peer-memory is off OR sender is unknown.
+    peer_context = ""
+    if peer_store is not None and notif.sender_username:
+        peer_context = peer_store.format_for_prompt(notif.sender_username)
+
     try:
         result = await _invoke_agent_with_retry(
-            agent, {"messages": [_build_event_message(notif)]}
+            agent,
+            {"messages": [_build_event_message(notif, peer_context=peer_context)]},
         )
         final = result["messages"][-1]
         logger.info("agent finished: %s", str(final.content)[:240].replace("\n", " "))
     except Exception:
         logger.exception("event handler failed (type=%s)", notif.notification_type)
+        return
+
+    # v0.5: record peer-memory observation AFTER successful dispatch so
+    # we don't accumulate state on failures we didn't actually handle.
+    if peer_store is not None and notif.sender_username:
+        try:
+            await asyncio.to_thread(
+                peer_store.record_observation,
+                notif.sender_username,
+                PeerObservation(
+                    kind=_observation_kind_for(notif),
+                    position=(notif.body or "")[:200] if notif.body else None,
+                ),
+                self_username=self_username,
+            )
+        except Exception as exc:  # noqa: BLE001 — must never crash dispatch
+            logger.warning("peer-memory: record_observation failed: %s", exc)
 
 
 async def main_async() -> None:
@@ -620,11 +746,76 @@ async def main_async() -> None:
         logger.warning("LANGFORD_INTERACT_ENABLED=false — exiting (no loops to run)")
         return
 
+    # v0.5: persistent peer-summary memory + autonomous voting.
+    # Both default off — operators flip them on per peer-memory.md /
+    # auto-vote.md guidance once they've watched the reactive loop.
+    self_username = me.get("username")
+    peer_store: JSONFilePeerMemoryStore | None = None
+    if os.environ.get("LANGFORD_PEER_MEMORY_ENABLED", "false").lower() == "true":
+        if not self_username:
+            logger.warning("LANGFORD_PEER_MEMORY_ENABLED=true but get_me() returned no username — disabling")
+        else:
+            peer_path = Path(
+                os.environ.get(
+                    "LANGFORD_PEER_MEMORY_PATH",
+                    str(default_peer_memory_path(self_username)),
+                )
+            ).expanduser()
+            peer_store = JSONFilePeerMemoryStore(peer_path)
+            logger.info("peer-memory: enabled at %s", peer_path)
+    else:
+        logger.info("peer-memory: disabled (LANGFORD_PEER_MEMORY_ENABLED!=true)")
+
+    auto_voter: AutoVoter | None = None
+    auto_vote_enabled = os.environ.get("LANGFORD_AUTO_VOTE_ENABLED", "false").lower() == "true"
+    if auto_vote_enabled:
+        auto_downvote_enabled = (
+            os.environ.get("LANGFORD_AUTO_DOWNVOTE_ENABLED", "false").lower() == "true"
+        )
+        max_per_run = int(os.environ.get("LANGFORD_AUTO_VOTE_MAX_PER_RUN", "2"))
+        # Scorer LLM defaults to the same Ollama model the agent uses
+        # (qwen3.6:27b on this host). Operators wanting cheaper scoring
+        # can point LANGFORD_SCORER_MODEL at a smaller local model.
+        scorer_model = os.environ.get("LANGFORD_SCORER_MODEL", ollama_model)
+        scorer_llm = (
+            llm
+            if scorer_model == ollama_model
+            else ChatOllama(
+                model=scorer_model,
+                base_url=ollama_url,
+                temperature=0.1,
+                num_predict=20,
+            )
+        )
+        auto_voter = AutoVoter(
+            toolkit=toolkit,
+            scorer_llm=scorer_llm,
+            upvote_enabled=True,
+            downvote_enabled=auto_downvote_enabled,
+            max_per_run=max_per_run,
+            peer_memory=peer_store,
+            self_username=self_username,
+        )
+        logger.info(
+            "auto-vote: enabled (downvote=%s, max_per_run=%d, scorer=%s)",
+            auto_downvote_enabled,
+            max_per_run,
+            scorer_model,
+        )
+    else:
+        logger.info("auto-vote: disabled (LANGFORD_AUTO_VOTE_ENABLED!=true)")
+
     poller = ColonyEventPoller(api_key=api_key, mark_read=True)
 
     @poller.on()
     async def on_event(notif: ColonyNotification) -> None:
-        await _handle_event(agent, notif)
+        await _handle_event(
+            agent,
+            notif,
+            auto_voter=auto_voter,
+            peer_store=peer_store,
+            self_username=self_username,
+        )
 
     stop_event = asyncio.Event()
 
