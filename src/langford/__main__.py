@@ -211,6 +211,8 @@ def _build_event_message(
     notif: ColonyNotification,
     *,
     peer_context: str = "",
+    parent_comment_body: str | None = None,
+    self_already_commented_top_level: bool = False,
 ) -> HumanMessage:
     """Turn a ColonyNotification into a HumanMessage for the agent.
 
@@ -242,7 +244,44 @@ def _build_event_message(
     elif notif.message:
         parts.append("")
         parts.append(f"Notification text: {notif.message}")
+
+    # v0.6.2: pre-load the parent comment content. Without this the
+    # agent has been falling back to "I can't fetch the specific
+    # comment content from the API" and producing a generic welcome
+    # rather than a threaded reply.
+    if parent_comment_body:
+        parts.append("")
+        parts.append(f"Parent comment you are replying to:\n{parent_comment_body}")
+
     parts.append("")
+    if notif.comment_id:
+        # v0.6.2: strong parent_comment_id directive. Earlier prompt
+        # said "<comment_id if it's a reply, else omit>" conditionally
+        # and the model ignored the condition, posting top-level
+        # duplicates. Make the requirement non-conditional.
+        parts.append(
+            "RESPONSE THREADING (CRITICAL): a Comment id is set on this "
+            "notification, which means you are replying to a specific "
+            "comment. When you call colony_comment_on_post, you MUST "
+            f"pass parent_comment_id=\"{notif.comment_id}\". Without "
+            "parent_comment_id the response posts as a TOP-LEVEL comment "
+            "on the post — that is forbidden because top-level comments "
+            "are reserved for first-encounter engagement and any further "
+            "top-level by you on this post is a duplicate."
+        )
+        parts.append("")
+    if self_already_commented_top_level:
+        parts.append(
+            "DUPLICATE GUARD (CRITICAL): you have already posted at least "
+            "one top-level comment on this post in this thread. Do NOT "
+            "post another top-level comment under any circumstances. If "
+            "you respond, you MUST set parent_comment_id to the Comment "
+            "id above so the reply threads under the specific comment. "
+            "If no comment_id is available and you have nothing to "
+            "thread under, say so briefly and stop instead of posting."
+        )
+        parts.append("")
+
     parts.append(
         "Decide whether to respond, and if so, use the appropriate "
         "Colony tool. If no response is warranted (e.g. vote, "
@@ -840,31 +879,78 @@ def _observation_kind_for(notif: ColonyNotification) -> str:
 _POST_LEVEL_DEDUP_TYPES = {"mention", "comment_on_post"}
 
 
-async def _self_already_commented(
+async def _self_comments_on_post(
     toolkit: ColonyToolkit,
     post_id: str,
     self_username: str,
-) -> bool:
-    """Return True when ``self_username`` already authored a comment on the post.
+) -> tuple[list[dict], int]:
+    """Return (all_comments, count_of_self_top_level_comments) for a post.
 
-    Cheap one-shot ``get_comments`` lookup. Used to avoid a duplicate
-    reply when the welcome loop has already posted on a candidate
-    that subsequently fires a mention/comment_on_post notification at
-    the interact loop. Errors degrade open (returns False) so a
-    transient API failure doesn't permanently silence Langford.
+    Combined helper for v0.6.2: the dedupe + post-dispatch validator
+    both want the comment list and a count of self top-level entries
+    on the same post, and one ``get_comments`` call covers both.
     """
     try:
         data = await asyncio.to_thread(toolkit.client.get_comments, post_id)
     except Exception:
-        return False
+        return [], 0
     items = (
         data
         if isinstance(data, list)
         else (data.get("items") or data.get("comments") or [])
     )
-    return any(
-        (c.get("author") or {}).get("username") == self_username for c in items
+    self_top_level = sum(
+        1
+        for c in items
+        if (c.get("author") or {}).get("username") == self_username
+        and not c.get("parent_id")
     )
+    return items, self_top_level
+
+
+async def _delete_comment_via_api(toolkit: ColonyToolkit, comment_id: str) -> bool:
+    """Delete a Langford-authored comment via the raw Colony API.
+
+    The Python SDK exposes ``delete_post`` but not ``delete_comment``;
+    the underlying endpoint ``DELETE /comments/{id}`` does work
+    (verified 2026-04-30 — returned 204 on a Langford comment within
+    the 15-min author-delete window). Authenticates by reusing the
+    SDK client's bearer token. Returns True on success.
+
+    Used as a post-dispatch safety net: if the agent posts a top-level
+    comment despite the v0.6.2 prompt directives, we delete it before
+    it lands in the public record. 15-min window means this only
+    works if the supervisor doesn't swap us out before the validator
+    fires — which is fine because the dispatch is sync to this loop
+    iteration.
+    """
+    import urllib.error
+    import urllib.request
+
+    client = toolkit.client
+    try:
+        client._ensure_token()
+    except Exception:
+        return False
+    token = getattr(client, "_token", None)
+    if not token:
+        return False
+    base = getattr(client, "base_url", "https://thecolony.cc/api/v1").rstrip("/")
+    url = f"{base}/comments/{comment_id}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return 200 <= r.status < 300
+    except urllib.error.HTTPError as exc:
+        logger.warning("delete_comment %s failed: HTTP %d %s", comment_id, exc.code, exc.reason)
+        return False
+    except Exception as exc:
+        logger.warning("delete_comment %s failed: %s", comment_id, exc)
+        return False
 
 
 async def _handle_event(
@@ -884,25 +970,29 @@ async def _handle_event(
         notif.comment_id,
     )
 
-    # v0.6.1: post-level dedupe. When a notification points at a post
-    # but no specific comment (mention in post body, comment_on_post on
-    # someone else's post), check whether Langford already commented.
-    # The welcome loop and the interact loop are independent, so when
-    # @colonist-one's intro arrives the welcome may run first and post,
-    # then the mention notification fires and the interact loop would
-    # post a near-duplicate. Real-world incident on @dantic's intro
-    # (2026-04-30) produced two welcomes per intro post via this race.
-    # Reply-to-comment notifications keep their normal handling — those
-    # carry comment_id and target a specific Langford comment that
-    # warrants a follow-up.
-    if (
-        toolkit is not None
-        and self_username
-        and notif.post_id
-        and notif.comment_id is None
-        and notif.notification_type in _POST_LEVEL_DEDUP_TYPES
-    ):
-        if await _self_already_commented(toolkit, notif.post_id, self_username):
+    # v0.6.1: post-level dedupe + v0.6.2: parent-comment pre-load and
+    # top-level-already-posted directive. One get_comments call up
+    # front; reuse for all three checks plus the post-dispatch
+    # validator at the bottom of this function.
+    pre_dispatch_comments: list[dict] = []
+    self_top_level_count = 0
+    parent_comment_body: str | None = None
+    if toolkit is not None and self_username and notif.post_id:
+        (
+            pre_dispatch_comments,
+            self_top_level_count,
+        ) = await _self_comments_on_post(toolkit, notif.post_id, self_username)
+
+        # v0.6.1 dedupe: post-level event with no specific target comment
+        # and we already replied? Skip.
+        if (
+            notif.comment_id is None
+            and notif.notification_type in _POST_LEVEL_DEDUP_TYPES
+            and any(
+                (c.get("author") or {}).get("username") == self_username
+                for c in pre_dispatch_comments
+            )
+        ):
             logger.info(
                 "skipping dispatch: self already commented on post %s "
                 "(type=%s, no comment_id)",
@@ -910,6 +1000,17 @@ async def _handle_event(
                 notif.notification_type,
             )
             return
+
+        # v0.6.2 pre-load: surface the parent comment body in the
+        # prompt so the agent doesn't fall back to "I can't fetch the
+        # specific comment content from the API" and post a generic
+        # welcome shape (real-world failure 2026-04-30, comment
+        # feb6353f, since deleted).
+        if notif.comment_id:
+            for c in pre_dispatch_comments:
+                if c.get("id") == notif.comment_id:
+                    parent_comment_body = c.get("body")
+                    break
 
     # v0.5: pre-agent auto-vote on the parent post when relevant.
     # Decision is fully deterministic — the LLM-pickable tools never
@@ -953,13 +1054,72 @@ async def _handle_event(
     try:
         result = await _invoke_agent_with_retry(
             agent,
-            {"messages": [_build_event_message(notif, peer_context=peer_context)]},
+            {
+                "messages": [
+                    _build_event_message(
+                        notif,
+                        peer_context=peer_context,
+                        parent_comment_body=parent_comment_body,
+                        self_already_commented_top_level=(self_top_level_count >= 1),
+                    )
+                ]
+            },
         )
         final = result["messages"][-1]
         logger.info("agent finished: %s", str(final.content)[:240].replace("\n", " "))
     except Exception:
         logger.exception("event handler failed (type=%s)", notif.notification_type)
         return
+
+    # v0.6.2 post-dispatch validator: if the agent posted a top-level
+    # comment despite the prompt directives — and we already had at
+    # least one top-level Langford comment on this post going in —
+    # delete the new dupe before it lands in the public record.
+    # 15-min author-delete window applies; this fires within seconds
+    # of dispatch so it's well inside that bound.
+    if (
+        toolkit is not None
+        and self_username
+        and notif.post_id
+        and self_top_level_count >= 1
+    ):
+        try:
+            post_dispatch_comments, _new_top_level_count = await _self_comments_on_post(
+                toolkit, notif.post_id, self_username
+            )
+        except Exception:
+            post_dispatch_comments = []
+        # Pick out new self top-level comments (those not present
+        # before dispatch). Compare by id.
+        prior_self_ids = {
+            c.get("id")
+            for c in pre_dispatch_comments
+            if (c.get("author") or {}).get("username") == self_username
+        }
+        new_self_top_level = [
+            c
+            for c in post_dispatch_comments
+            if (c.get("author") or {}).get("username") == self_username
+            and not c.get("parent_id")
+            and c.get("id") not in prior_self_ids
+        ]
+        for c in new_self_top_level:
+            cid = c.get("id")
+            if not cid:
+                continue
+            logger.warning(
+                "post-dispatch: deleting new top-level dupe comment %s "
+                "(post %s already had %d top-level by self)",
+                cid,
+                notif.post_id,
+                self_top_level_count,
+            )
+            ok = await _delete_comment_via_api(toolkit, cid)
+            logger.info(
+                "post-dispatch: delete %s %s",
+                cid,
+                "ok" if ok else "FAILED",
+            )
 
     # v0.5: record peer-memory observation AFTER successful dispatch so
     # we don't accumulate state on failures we didn't actually handle.
