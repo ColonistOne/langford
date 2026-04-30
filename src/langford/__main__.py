@@ -19,6 +19,7 @@ import random
 import signal
 import sys
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -548,6 +549,278 @@ async def _engage_loop(
                 return
 
 
+# ── Welcome loop (v0.6) ──────────────────────────────────────────────
+#
+# Specialised engagement: walk recent posts in c/introductions, find ones
+# from genuinely-new agents (joined recently, low karma), and post a
+# brief, specific welcome — only when there's a real hook to comment on.
+# The agent can choose to skip; this is meant to read as engagement, not
+# as a script.
+
+
+def _parse_iso_utc(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _build_welcome_message(post: dict, comments: list[dict], author: dict) -> HumanMessage:
+    """Frame an introductions-colony candidate for the welcome agent.
+
+    Constrains the agent to a single action: comment a brief specific
+    welcome, or skip. The system prompt's honesty / length / tool-error
+    rules still apply on top of this task framing.
+    """
+    pid = post.get("id") or ""
+    title = post.get("title") or ""
+    body = (post.get("body") or "")[:2000]
+    a_user = author.get("username") or "?"
+    a_disp = author.get("display_name") or a_user
+    a_karma = author.get("karma")
+    a_joined_raw = author.get("created_at")
+    joined = _parse_iso_utc(a_joined_raw)
+    if joined is not None:
+        age_days = (datetime.now(timezone.utc) - joined).days
+        joined_str = f"{joined.date().isoformat()} ({age_days} days ago)"
+    else:
+        joined_str = "(unknown)"
+    bio = (author.get("bio") or "").strip()
+    parts = [
+        "Welcome task: a recently-joined agent has posted in the c/introductions colony.",
+        "Read what they wrote about themselves and decide whether to welcome them.",
+        "",
+        f"Post id: {pid}",
+        f"Author: @{a_user} (display: {a_disp})",
+        f"  joined: {joined_str}",
+        f"  karma: {a_karma}",
+        f"  bio: {bio or '(none)'}",
+        f"Title: {title}",
+        "",
+        "Body:",
+        body,
+    ]
+    if comments:
+        parts.append("")
+        parts.append(f"Existing comments on this intro ({len(comments)}):")
+        for c in comments[:5]:
+            cu = (c.get("author") or {}).get("username") or "?"
+            cb = (c.get("body") or "").replace("\n", " ")[:200]
+            parts.append(f"  @{cu}: {cb}")
+    parts.extend(
+        [
+            "",
+            "A welcome is appropriate when ALL of these hold:",
+            "  * The post is genuinely an introduction (not a bug report, support",
+            "    question, or off-topic post that happened to land in c/introductions).",
+            "  * You can find a SPECIFIC hook in what they wrote — their stack, what",
+            "    they're building, an angle, a relatable framing. Generic 'welcome'",
+            "    is not enough.",
+            "  * The thread isn't already saturated with warm replies that leave",
+            "    nothing distinctive for you to add.",
+            "",
+            "If you welcome them, CALL colony_comment_on_post(post_id, body=<welcome>):",
+            "  * Brief — 2-3 sentences. New arrivals shouldn't face a wall of text",
+            "    on day one.",
+            "  * Reference ONE specific thing from their post or bio. No generic",
+            "    'welcome to The Colony' — show you actually read what they wrote.",
+            "  * Optionally suggest ONE concrete next step IF it's genuinely useful",
+            "    — a relevant colony for their interest, an active thread, an agent",
+            "    they should DM. Skip the suggestion if it would feel forced or",
+            "    sales-y.",
+            "  * Match their tone: technical → technical, casual → casual.",
+            "  * Do NOT lecture, do NOT pitch The Colony's features, do NOT list",
+            "    multiple sub-colonies as if it's a brochure, do NOT use marketing",
+            "    voice ('exciting to have you!', 'so glad you joined!').",
+            "  * Sign off naturally — your username appears next to the comment",
+            "    automatically; no need to add '— Langford'.",
+            "",
+            "If you skip, output the EXACT text 'skip' as your final message and stop.",
+            "Do not call any other tool.",
+            "",
+            "ONE action only. After colony_comment_on_post OR 'skip', the welcome",
+            "task is COMPLETE. A second tool call is a hallucinated extra action.",
+        ]
+    )
+    return HumanMessage(content="\n".join(parts))
+
+
+def _is_new_agent(author: dict, *, max_age_days: int, max_karma: int) -> bool:
+    """Heuristic for 'new agent' suitable for an intro welcome."""
+    if author.get("user_type") != "agent":
+        return False
+    joined = _parse_iso_utc(author.get("created_at"))
+    if joined is None:
+        return False
+    if datetime.now(timezone.utc) - joined > timedelta(days=max_age_days):
+        return False
+    try:
+        karma = int(author.get("karma") or 0)
+    except (TypeError, ValueError):
+        karma = 0
+    if karma > max_karma:
+        return False
+    return True
+
+
+async def _welcome_tick(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    *,
+    candidate_limit: int,
+    seen_ids: set[str],
+    seen_file: Path | None,
+    new_agent_max_days: int,
+    new_agent_max_karma: int,
+) -> None:
+    """One welcome tick — find an eligible intro post, dispatch the agent."""
+    try:
+        data = await asyncio.to_thread(
+            toolkit.client.get_posts, colony="introductions", limit=candidate_limit
+        )
+    except Exception as exc:
+        logger.warning("welcome: get_posts(introductions) failed: %s", exc)
+        return
+    items = data if isinstance(data, list) else (data.get("items") or data.get("posts") or [])
+    my_id = me.get("id") or ""
+    my_username = me.get("username")
+
+    for post in items:
+        pid = post.get("id")
+        if not pid or pid in seen_ids:
+            continue
+        author = post.get("author") or {}
+        if author.get("id") == my_id:
+            continue
+        if post.get("is_locked") or post.get("is_deleted"):
+            continue
+        if not _is_new_agent(
+            author,
+            max_age_days=new_agent_max_days,
+            max_karma=new_agent_max_karma,
+        ):
+            continue
+
+        # Has Langford already commented here? One get_comments call per
+        # candidate is cheap and prevents double-welcomes when the seen
+        # file is missing or wiped.
+        comments_data: Any = {}
+        try:
+            comments_data = await asyncio.to_thread(toolkit.client.get_comments, pid)
+        except Exception as exc:
+            logger.debug("welcome: get_comments failed: %s", exc)
+            continue
+        comments = (
+            comments_data
+            if isinstance(comments_data, list)
+            else (comments_data.get("items") or comments_data.get("comments") or [])
+        )
+        if my_username and any(
+            (c.get("author") or {}).get("username") == my_username for c in comments
+        ):
+            # Already replied. Persist to seen so we skip cheaply.
+            seen_ids.add(pid)
+            if seen_file is not None:
+                with suppress(OSError):
+                    with seen_file.open("a", encoding="utf-8") as f:
+                        f.write(pid + "\n")
+            continue
+
+        # Got a candidate. Persist BEFORE dispatch so a crash mid-LLM
+        # doesn't leave us re-evaluating the same post next tick.
+        seen_ids.add(pid)
+        if seen_file is not None:
+            with suppress(OSError):
+                with seen_file.open("a", encoding="utf-8") as f:
+                    f.write(pid + "\n")
+
+        logger.info(
+            "welcome tick: candidate=%s author=@%s karma=%s joined=%s comments=%d",
+            pid[:8],
+            author.get("username", "?"),
+            author.get("karma"),
+            (author.get("created_at") or "?")[:10],
+            len(comments),
+        )
+
+        try:
+            result = await _invoke_agent_with_retry(
+                agent,
+                {"messages": [_build_welcome_message(post, comments, author)]},
+            )
+            final = result["messages"][-1]
+            logger.info(
+                "welcome finished: %s",
+                str(final.content)[:240].replace("\n", " "),
+            )
+        except Exception:
+            logger.exception("welcome handler failed")
+        return
+
+    logger.info(
+        "welcome tick: no eligible candidates (scanned %d intros)", len(items)
+    )
+
+
+async def _welcome_loop(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    *,
+    interval_min: int,
+    interval_max: int,
+    candidate_limit: int,
+    seen_file: Path | None,
+    new_agent_max_days: int,
+    new_agent_max_karma: int,
+    stop_event: asyncio.Event,
+) -> None:
+    """Long-running welcome tick driver. Cadence mirrors the engage loop."""
+    seen_ids: set[str] = set()
+    if seen_file is not None and seen_file.exists():
+        try:
+            seen_ids = {
+                line.strip()
+                for line in seen_file.read_text().splitlines()
+                if line.strip()
+            }
+            logger.info(
+                "welcome: loaded %d seen post ids from %s", len(seen_ids), seen_file
+            )
+        except OSError as exc:
+            logger.warning("welcome: failed to load seen file: %s", exc)
+
+    logger.info(
+        "🤝 welcome loop starting (interval %d-%ds, max_age=%dd, max_karma=%d)",
+        interval_min,
+        interval_max,
+        new_agent_max_days,
+        new_agent_max_karma,
+    )
+    while not stop_event.is_set():
+        try:
+            await _welcome_tick(
+                agent=agent,
+                toolkit=toolkit,
+                me=me,
+                candidate_limit=candidate_limit,
+                seen_ids=seen_ids,
+                seen_file=seen_file,
+                new_agent_max_days=new_agent_max_days,
+                new_agent_max_karma=new_agent_max_karma,
+            )
+        except Exception:
+            logger.exception("welcome tick failed at top level")
+        delay = random.uniform(interval_min, interval_max)
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            if stop_event.is_set():
+                return
+
+
 _VOTE_ELIGIBLE_NOTIF_TYPES = {"mention", "reply", "comment_on_post"}
 
 
@@ -667,6 +940,7 @@ async def main_async() -> None:
     poll_interval = int(os.environ.get("LANGFORD_POLL_INTERVAL_SEC", "120"))
     interact_enabled = os.environ.get("LANGFORD_INTERACT_ENABLED", "true").lower() == "true"
     engage_enabled = os.environ.get("LANGFORD_ENGAGE_ENABLED", "false").lower() == "true"
+    welcome_enabled = os.environ.get("LANGFORD_WELCOME_ENABLED", "false").lower() == "true"
     post_enabled = os.environ.get("LANGFORD_POST_ENABLED", "false").lower() == "true"
 
     # Safety gates (v0.2). Pause the loop when karma drops below the
@@ -700,6 +974,19 @@ async def main_async() -> None:
     engage_candidate_limit = int(os.environ.get("LANGFORD_ENGAGE_CANDIDATE_LIMIT", "10"))
     seen_posts_file = Path(
         os.environ.get("LANGFORD_SEEN_POSTS_FILE", ".engaged-posts.txt")
+    ).expanduser()
+
+    # Welcome loop config (v0.6). Disabled by default. Walks recent
+    # c/introductions posts and welcomes new agents (recently joined,
+    # low karma) with a brief, specific comment. Independent cadence
+    # from the engage loop; defaults match its 15-45 min jitter.
+    welcome_interval_min = int(os.environ.get("LANGFORD_WELCOME_INTERVAL_MIN_SEC", "900"))
+    welcome_interval_max = int(os.environ.get("LANGFORD_WELCOME_INTERVAL_MAX_SEC", "2700"))
+    welcome_candidate_limit = int(os.environ.get("LANGFORD_WELCOME_CANDIDATE_LIMIT", "15"))
+    welcome_new_agent_max_days = int(os.environ.get("LANGFORD_WELCOME_NEW_AGENT_MAX_DAYS", "14"))
+    welcome_new_agent_max_karma = int(os.environ.get("LANGFORD_WELCOME_NEW_AGENT_MAX_KARMA", "50"))
+    welcomed_posts_file = Path(
+        os.environ.get("LANGFORD_WELCOMED_POSTS_FILE", ".welcomed-posts.txt")
     ).expanduser()
 
     # num_predict caps output tokens. Ollama's default is 128 which
@@ -868,6 +1155,25 @@ async def main_async() -> None:
                     name="engage-loop",
                 )
             )
+
+    if welcome_enabled:
+        tasks.append(
+            asyncio.create_task(
+                _welcome_loop(
+                    agent=agent,
+                    toolkit=toolkit,
+                    me=me,
+                    interval_min=welcome_interval_min,
+                    interval_max=welcome_interval_max,
+                    candidate_limit=welcome_candidate_limit,
+                    seen_file=welcomed_posts_file,
+                    new_agent_max_days=welcome_new_agent_max_days,
+                    new_agent_max_karma=welcome_new_agent_max_karma,
+                    stop_event=stop_event,
+                ),
+                name="welcome-loop",
+            )
+        )
 
     try:
         await stop_event.wait()
