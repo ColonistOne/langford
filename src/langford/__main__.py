@@ -837,10 +837,41 @@ def _observation_kind_for(notif: ColonyNotification) -> str:
     return "comment-on-self"
 
 
+_POST_LEVEL_DEDUP_TYPES = {"mention", "comment_on_post"}
+
+
+async def _self_already_commented(
+    toolkit: ColonyToolkit,
+    post_id: str,
+    self_username: str,
+) -> bool:
+    """Return True when ``self_username`` already authored a comment on the post.
+
+    Cheap one-shot ``get_comments`` lookup. Used to avoid a duplicate
+    reply when the welcome loop has already posted on a candidate
+    that subsequently fires a mention/comment_on_post notification at
+    the interact loop. Errors degrade open (returns False) so a
+    transient API failure doesn't permanently silence Langford.
+    """
+    try:
+        data = await asyncio.to_thread(toolkit.client.get_comments, post_id)
+    except Exception:
+        return False
+    items = (
+        data
+        if isinstance(data, list)
+        else (data.get("items") or data.get("comments") or [])
+    )
+    return any(
+        (c.get("author") or {}).get("username") == self_username for c in items
+    )
+
+
 async def _handle_event(
     agent,
     notif: ColonyNotification,
     *,
+    toolkit: ColonyToolkit | None = None,
     auto_voter: AutoVoter | None = None,
     peer_store: JSONFilePeerMemoryStore | None = None,
     self_username: str | None = None,
@@ -852,6 +883,33 @@ async def _handle_event(
         notif.post_id,
         notif.comment_id,
     )
+
+    # v0.6.1: post-level dedupe. When a notification points at a post
+    # but no specific comment (mention in post body, comment_on_post on
+    # someone else's post), check whether Langford already commented.
+    # The welcome loop and the interact loop are independent, so when
+    # @colonist-one's intro arrives the welcome may run first and post,
+    # then the mention notification fires and the interact loop would
+    # post a near-duplicate. Real-world incident on @dantic's intro
+    # (2026-04-30) produced two welcomes per intro post via this race.
+    # Reply-to-comment notifications keep their normal handling — those
+    # carry comment_id and target a specific Langford comment that
+    # warrants a follow-up.
+    if (
+        toolkit is not None
+        and self_username
+        and notif.post_id
+        and notif.comment_id is None
+        and notif.notification_type in _POST_LEVEL_DEDUP_TYPES
+    ):
+        if await _self_already_commented(toolkit, notif.post_id, self_username):
+            logger.info(
+                "skipping dispatch: self already commented on post %s "
+                "(type=%s, no comment_id)",
+                notif.post_id,
+                notif.notification_type,
+            )
+            return
 
     # v0.5: pre-agent auto-vote on the parent post when relevant.
     # Decision is fully deterministic — the LLM-pickable tools never
@@ -1099,6 +1157,7 @@ async def main_async() -> None:
         await _handle_event(
             agent,
             notif,
+            toolkit=toolkit,
             auto_voter=auto_voter,
             peer_store=peer_store,
             self_username=self_username,
