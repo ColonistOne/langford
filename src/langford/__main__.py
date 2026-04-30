@@ -928,6 +928,80 @@ def _build_follow_prompt(username: str, count: int) -> HumanMessage:
     )
 
 
+async def _enrich_notification_senders(
+    client: Any,
+    items: list[dict],
+    self_username: str,
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Fetch sender username + id for each notification.
+
+    The Colony API's ``GET /notifications`` does NOT include a sender
+    object — only the ``message`` text mentions the sender by display
+    name. To get the username (which is what we filter on) we have to
+    fetch the underlying comment or post.
+
+    Strategy: per notification, when ``comment_id`` is set fetch
+    ``get_comments(post_id)`` once per post and look up the comment;
+    when only ``post_id`` is set (mention in post body) fetch
+    ``get_post(post_id)`` and use the post's author. Per-tick caches
+    by post_id so a noisy thread costs one API call.
+
+    Returns (sender_counts, sender_ids).
+    """
+    sender_counts: dict[str, int] = {}
+    sender_ids: dict[str, str] = {}
+    comments_cache: dict[str, list[dict]] = {}
+    posts_cache: dict[str, dict] = {}
+
+    for n in items:
+        post_id = n.get("post_id")
+        comment_id = n.get("comment_id")
+        ntype = n.get("notification_type") or ""
+        if not post_id:
+            continue
+
+        sender_uname: str | None = None
+        sender_uid: str | None = None
+
+        if comment_id:
+            if post_id not in comments_cache:
+                try:
+                    data = await asyncio.to_thread(client.get_comments, post_id)
+                    comments_cache[post_id] = (
+                        data
+                        if isinstance(data, list)
+                        else (data.get("items") or data.get("comments") or [])
+                    )
+                except Exception:
+                    comments_cache[post_id] = []
+            for c in comments_cache[post_id]:
+                if c.get("id") == comment_id:
+                    a = c.get("author") or {}
+                    sender_uname = a.get("username")
+                    sender_uid = a.get("id")
+                    break
+        elif ntype in ("mention", "comment_on_post"):
+            if post_id not in posts_cache:
+                try:
+                    posts_cache[post_id] = await asyncio.to_thread(
+                        client.get_post, post_id
+                    )
+                except Exception:
+                    posts_cache[post_id] = {}
+            p = posts_cache.get(post_id) or {}
+            a = p.get("author") or {}
+            sender_uname = a.get("username")
+            sender_uid = a.get("id")
+
+        if not sender_uname or sender_uname == self_username:
+            continue
+        sender_counts[sender_uname] = sender_counts.get(sender_uname, 0) + 1
+        if sender_uid and sender_uname not in sender_ids:
+            sender_ids[sender_uname] = sender_uid
+
+    return sender_counts, sender_ids
+
+
 async def _maybe_follow_someone(
     agent: Any,
     toolkit: ColonyToolkit,
@@ -963,18 +1037,9 @@ async def _maybe_follow_someone(
         else (notifs.get("items") or notifs.get("notifications") or [])
     )
 
-    # Build (username, user_id, count) triples from notification senders.
-    sender_counts: dict[str, int] = {}
-    sender_ids: dict[str, str] = {}
-    for n in items:
-        sender_obj = n.get("sender") or {}
-        sender_uname = sender_obj.get("username") or n.get("sender_username")
-        sender_uid = sender_obj.get("id") or n.get("sender_id")
-        if not sender_uname or sender_uname == self_username:
-            continue
-        sender_counts[sender_uname] = sender_counts.get(sender_uname, 0) + 1
-        if sender_uid and sender_uname not in sender_ids:
-            sender_ids[sender_uname] = sender_uid
+    sender_counts, sender_ids = await _enrich_notification_senders(
+        toolkit.client, items, self_username
+    )
 
     candidates = [
         (u, c)
