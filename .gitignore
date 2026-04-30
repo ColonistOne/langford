@@ -8,3 +8,5 @@ agent.log
 dist/
 build/
 .uv-cache/
+.followed-users.txt
+.follows-log.txt

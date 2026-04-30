@@ -860,6 +860,189 @@ async def _welcome_loop(
                 return
 
 
+# ── Follow loop (v0.7) ──────────────────────────────────────────────
+#
+# Once-per-boot decision: scan recent notifications, find the sender
+# who's interacted with Langford most, evaluate via LLM whether to
+# follow them. Mechanical follow call (not via tool) so the rate limit
+# always holds. Off by default.
+
+
+def _today_iso_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _load_followed(file: Path) -> set[str]:
+    if not file.exists():
+        return set()
+    try:
+        return {
+            line.strip()
+            for line in file.read_text().splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return set()
+
+
+def _count_today_follows(log_file: Path) -> int:
+    if not log_file.exists():
+        return 0
+    today = _today_iso_utc()
+    try:
+        return sum(
+            1
+            for line in log_file.read_text().splitlines()
+            if line.startswith(today)
+        )
+    except OSError:
+        return 0
+
+
+def _record_follow(followed_file: Path, log_file: Path, username: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with suppress(OSError):
+        with followed_file.open("a", encoding="utf-8") as f:
+            f.write(username + "\n")
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(f"{ts} {username}\n")
+
+
+def _build_follow_prompt(username: str, count: int) -> HumanMessage:
+    return HumanMessage(
+        content=(
+            f"Follow evaluation: @{username} has shown up in your inbox "
+            f"{count} times recently — mentions, replies to your comments, "
+            "or comments on your posts. They have actively engaged with "
+            "your work.\n\n"
+            f"Decide whether to follow @{username}. Following means their "
+            "future posts appear in your feed. Don't follow casually. "
+            "Only follow when there is a clear pattern of substantive "
+            "value, not just volume. If you cannot recall the substance "
+            "of what they have said, default to 'skip'.\n\n"
+            "Output ONE word as your final answer: 'follow' if yes, 'skip' "
+            "if no. Do not call any tool. The follow itself is handled "
+            "mechanically after your decision — calling colony_follow_user "
+            "yourself bypasses the rate limit and is forbidden."
+        )
+    )
+
+
+async def _maybe_follow_someone(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    self_username: str,
+    *,
+    followed_file: Path,
+    log_file: Path,
+    daily_limit: int,
+    min_interactions: int,
+) -> None:
+    """One-shot per boot: pick most-engaged unfollowed sender, eval, follow."""
+    if daily_limit <= 0:
+        return
+    daily = _count_today_follows(log_file)
+    if daily >= daily_limit:
+        logger.info(
+            "follow: daily limit reached (%d/%d) — skipping", daily, daily_limit
+        )
+        return
+
+    followed = _load_followed(followed_file)
+
+    try:
+        notifs = await asyncio.to_thread(
+            toolkit.client.get_notifications, unread_only=False
+        )
+    except Exception as exc:
+        logger.warning("follow: get_notifications failed: %s", exc)
+        return
+    items = (
+        notifs
+        if isinstance(notifs, list)
+        else (notifs.get("items") or notifs.get("notifications") or [])
+    )
+
+    # Build (username, user_id, count) triples from notification senders.
+    sender_counts: dict[str, int] = {}
+    sender_ids: dict[str, str] = {}
+    for n in items:
+        sender_obj = n.get("sender") or {}
+        sender_uname = sender_obj.get("username") or n.get("sender_username")
+        sender_uid = sender_obj.get("id") or n.get("sender_id")
+        if not sender_uname or sender_uname == self_username:
+            continue
+        sender_counts[sender_uname] = sender_counts.get(sender_uname, 0) + 1
+        if sender_uid and sender_uname not in sender_ids:
+            sender_ids[sender_uname] = sender_uid
+
+    candidates = [
+        (u, c)
+        for u, c in sender_counts.items()
+        if u not in followed and c >= min_interactions
+    ]
+    if not candidates:
+        logger.info(
+            "follow: no candidates (followed=%d, distinct senders=%d, "
+            "threshold=%d)",
+            len(followed),
+            len(sender_counts),
+            min_interactions,
+        )
+        return
+    candidates.sort(key=lambda x: -x[1])
+    top_user, top_count = candidates[0]
+
+    logger.info(
+        "follow: evaluating @%s (count=%d, %d/%d daily, %d already followed)",
+        top_user,
+        top_count,
+        daily,
+        daily_limit,
+        len(followed),
+    )
+
+    try:
+        result = await _invoke_agent_with_retry(
+            agent,
+            {"messages": [_build_follow_prompt(top_user, top_count)]},
+        )
+        final = result["messages"][-1]
+        decision = str(final.content).strip().lower()
+    except Exception:
+        logger.exception("follow eval failed")
+        return
+
+    logger.info("follow: agent decision for @%s: %s", top_user, decision[:120])
+
+    if not decision.startswith("follow"):
+        logger.info("follow: skipped @%s", top_user)
+        return
+
+    # Mechanical follow call. SDK takes user_id (UUID), not username.
+    target_uid = sender_ids.get(top_user)
+    if not target_uid:
+        # Fallback: directory lookup by username.
+        try:
+            data = await asyncio.to_thread(toolkit.client.directory, query=top_user, limit=5)
+            users = data.get("items") if isinstance(data, dict) else (data or [])
+            for u in users or []:
+                if u.get("username") == top_user:
+                    target_uid = u.get("id")
+                    break
+        except Exception as exc:
+            logger.warning("follow: directory lookup for @%s failed: %s", top_user, exc)
+    if not target_uid:
+        logger.warning("follow: no user_id for @%s — abort", top_user)
+        return
+    try:
+        await asyncio.to_thread(toolkit.client.follow, target_uid)
+        _record_follow(followed_file, log_file, top_user)
+        logger.info("follow: ✓ followed @%s (uid %s)", top_user, target_uid)
+    except Exception:
+        logger.exception("follow: API call failed for @%s", top_user)
+
+
 _VOTE_ELIGIBLE_NOTIF_TYPES = {"mention", "reply", "comment_on_post"}
 
 
@@ -1338,6 +1521,33 @@ async def main_async() -> None:
         "disabled" if min_karma <= _KARMA_DISABLED else min_karma,
         health_check,
     )
+
+    # v0.7: per-boot follow tick. Fires once before loops start. Off by
+    # default; flipped on in local .env per operator decision.
+    follow_enabled = os.environ.get("LANGFORD_FOLLOW_ENABLED", "false").lower() == "true"
+    if follow_enabled and self_username:
+        followed_file = Path(
+            os.environ.get("LANGFORD_FOLLOWED_FILE", ".followed-users.txt")
+        ).expanduser()
+        follows_log_file = Path(
+            os.environ.get("LANGFORD_FOLLOWS_LOG_FILE", ".follows-log.txt")
+        ).expanduser()
+        follow_daily_limit = int(os.environ.get("LANGFORD_FOLLOW_DAILY_LIMIT", "2"))
+        follow_min_interactions = int(
+            os.environ.get("LANGFORD_FOLLOW_MIN_INTERACTIONS", "3")
+        )
+        try:
+            await _maybe_follow_someone(
+                agent,
+                toolkit,
+                self_username,
+                followed_file=followed_file,
+                log_file=follows_log_file,
+                daily_limit=follow_daily_limit,
+                min_interactions=follow_min_interactions,
+            )
+        except Exception:
+            logger.exception("follow tick top-level failure")
 
     tasks: list[asyncio.Task] = [
         asyncio.create_task(
