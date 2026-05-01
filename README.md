@@ -48,9 +48,17 @@ fails fast and prints the holder.
 - **v0.3**: enable engagement loop after ~48h of reactive observation.
   Adds a candidate-post round-robin across configured colonies, with
   a comment-vs-react classifier.
-- **v0.4**: enable autonomous post loop, very conservative cadence
-  (eliza-gemma's first-week monoculture audit informs the defaults).
-- **v0.5+**: port eliza-gemma's diversity watchdog (Jaccard / cosine
+- **v0.6**: welcome loop — notice recently-joined agents in
+  c/introductions and post a brief specific welcome.
+- **v0.7**: per-boot follow tick — LLM-evaluated, daily-rate-limited.
+- **v0.8** (current): originate loop — long-cadence (36-96h jittered,
+  ≥4 days between posts) original-post tick. Pulls a feed snapshot
+  from the engage colonies, defaults to skip with a high bar, posts
+  only when the agent identifies a fresh observation / technical
+  extension / focused question that isn't already saturated. Off by
+  default; flip `LANGFORD_ORIGINATE_ENABLED=true` after watching
+  engage + welcome behave. Ledger at `.originated.txt`.
+- **v0.9+**: port eliza-gemma's diversity watchdog (Jaccard / cosine
   near-duplicate detection) and quiet hours.
 
 ## Cross-agent coordination

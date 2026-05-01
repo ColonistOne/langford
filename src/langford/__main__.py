@@ -874,6 +874,383 @@ async def _welcome_loop(
                 return
 
 
+# ── Originate loop (v0.8) ──────────────────────────────────────────
+#
+# Long-cadence original-post tick. Pulls a feed snapshot from the
+# engage colonies, frames a one-shot prompt with a strong "default
+# skip" bias, and lets the agent decide whether it has something
+# fresh to post. Off by default. Rate-limited via a ledger file:
+# never two `posted` entries within ``min_days_between`` days, and
+# the loop's jittered cadence is measured in days, not minutes.
+# Designed to land at roughly one substantive original post per
+# ~4-7 days when enabled.
+
+
+def _last_originated_at(ledger_file: Path) -> datetime | None:
+    """Return the timestamp of the most recent successful 'posted' entry.
+
+    Ledger lines are tab-separated:
+      ``<iso-ts>\\tposted\\t<post_id>\\t<title>``
+      ``<iso-ts>\\tskip\\t<reason>``
+
+    `skip` rows are ignored — only `posted` rows enforce the gap.
+    """
+    if not ledger_file.exists():
+        return None
+    last: datetime | None = None
+    try:
+        for line in ledger_file.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) < 2:
+                continue
+            ts_s, kind = parts[0], parts[1]
+            if kind != "posted":
+                continue
+            ts = _parse_iso_utc(ts_s)
+            if ts is None:
+                continue
+            if last is None or ts > last:
+                last = ts
+    except OSError:
+        return None
+    return last
+
+
+def _record_originate_skip(ledger_file: Path, reason: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    safe_reason = (reason or "").replace("\t", " ").replace("\n", " ")[:200]
+    with suppress(OSError):
+        with ledger_file.open("a", encoding="utf-8") as f:
+            f.write(f"{ts}\tskip\t{safe_reason}\n")
+
+
+def _record_originate_post(ledger_file: Path, post_id: str, title: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    safe_title = (title or "").replace("\t", " ").replace("\n", " ")[:200]
+    with suppress(OSError):
+        with ledger_file.open("a", encoding="utf-8") as f:
+            f.write(f"{ts}\tposted\t{post_id}\t{safe_title}\n")
+
+
+async def _pull_feed_snapshot(
+    toolkit: ColonyToolkit,
+    colonies: list[str],
+    *,
+    per_colony: int,
+    my_id: str,
+) -> list[dict]:
+    """Pull a small recent-feed snapshot for the originate prompt.
+
+    Returns up to ``per_colony`` posts per colony, sorted newest first
+    within each colony, excluding the agent's own posts and any post
+    already locked or deleted. The returned dict is intentionally
+    flat — title, body excerpt, author, score, comment_count — so the
+    prompt builder can format without re-fetching.
+    """
+    out: list[dict] = []
+    for slug in colonies:
+        try:
+            data = await asyncio.to_thread(
+                toolkit.client.get_posts, colony=slug, limit=per_colony
+            )
+        except Exception as exc:
+            logger.warning("originate: get_posts(%s) failed: %s", slug, exc)
+            continue
+        items = (
+            data
+            if isinstance(data, list)
+            else (data.get("items") or data.get("posts") or [])
+        )
+        for p in items:
+            author = p.get("author") or {}
+            if author.get("id") == my_id:
+                continue
+            if p.get("is_locked") or p.get("is_deleted"):
+                continue
+            out.append(
+                {
+                    "colony": slug,
+                    "title": (p.get("title") or "")[:120],
+                    "body": (p.get("body") or "")[:400],
+                    "author": author.get("username") or "?",
+                    "score": int(p.get("score") or 0),
+                    "comment_count": int(p.get("comment_count") or 0),
+                    "created_at": p.get("created_at") or "",
+                }
+            )
+    return out
+
+
+def _build_originate_message(
+    snapshot: list[dict],
+    *,
+    framework_lens: str,
+    post_colonies: list[str],
+) -> HumanMessage:
+    """Frame the originate task: feed snapshot + a strong skip bias.
+
+    The agent is told that most ticks should resolve to ``skip``. A
+    post is warranted only when there's a genuinely fresh observation,
+    technical extension, focused question, or empirical data point
+    NOT already saturated in the snapshot.
+    """
+    parts: list[str] = [
+        "Originate task: decide whether to post something original to "
+        "The Colony right now.",
+        "",
+        "This is the LOW-FREQUENCY path. Most originate ticks resolve "
+        "to 'skip' and that is the correct outcome. Posting filler — "
+        "a restatement of a recent thread, a generic opinion, an "
+        '"AMA me about X", or a marketing pitch for your stack — '
+        "burns reader attention and tanks your karma. ONE substantive "
+        "post a week beats five mediocre ones.",
+        "",
+        f"Your distinctive lens: {framework_lens}",
+        "",
+        "Below is a snapshot of what's been discussed lately in the "
+        "colonies you watch. Read it. Then ask yourself: do I have a "
+        "concrete observation, a fresh technical extension, a focused "
+        "question, or an empirical data point that is NOT already in "
+        "this list and that's actually worth a reader's two minutes?",
+        "",
+        "--- Recent feed snapshot ---",
+    ]
+    if not snapshot:
+        parts.append("(no posts pulled — the feed is unusually empty)")
+    else:
+        for s in snapshot:
+            head = f"[c/{s['colony']}] @{s['author']} | s={s['score']} cmts={s['comment_count']} | {s['title']}"
+            body_excerpt = (s["body"] or "").replace("\n", " ")[:240]
+            if body_excerpt:
+                parts.append(f"  {head}\n    {body_excerpt}")
+            else:
+                parts.append(f"  {head}")
+    parts.extend(
+        [
+            "",
+            "--- Decision ---",
+            "Pick ONE action and stop. THIS IS A ONE-SHOT TASK:",
+            "",
+            "  * If you genuinely have something fresh and substantive — "
+            "CALL colony_create_post(colony=<one of: "
+            + ", ".join(f'"{c}"' for c in post_colonies)
+            + ">, title=<a 6-12-word specific phrase>, body=<3-6 short "
+            "paragraphs>, post_type=\"discussion\") and stop.",
+            "",
+            "  * Otherwise — output the EXACT text 'skip' as your final "
+            "message and stop. Do NOT call any tool. Skip is the right "
+            "answer most of the time.",
+            "",
+            "Title rules: NO clickbait, NO hype, NO question marks "
+            "unless the post body is genuinely a question post. Avoid "
+            "openers like 'Why I think...' / 'A note on...' / 'Some "
+            "thoughts on...'. Lead with the observation itself.",
+            "",
+            "Body rules: open with the observation in the first "
+            "sentence (no preamble). Plain-spoken, technical, "
+            "specific. End without a soft 'thoughts?' close. If the "
+            "post belongs in c/findings it should report a genuine "
+            "finding from your own running, not just commentary.",
+            "",
+            "Forbidden topics: restating a thread that's already in "
+            "the snapshot above; broad opinion essays without a "
+            "technical hook; promoting your own stack; introducing "
+            "yourself again; meta-commentary about Colony itself "
+            "unless you have a concrete proposal.",
+            "",
+            "CRITICAL — one action means ONE: after colony_create_post "
+            "returns successfully, the originate task is COMPLETE. A "
+            "second tool call is a hallucinated extra action.",
+        ]
+    )
+    return HumanMessage(content="\n".join(parts))
+
+
+async def _originate_tick(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    *,
+    feed_colonies: list[str],
+    post_colonies: list[str],
+    feed_per_colony: int,
+    framework_lens: str,
+    ledger_file: Path,
+    min_days_between: int,
+) -> None:
+    """One originate tick — gate on ledger, pull feed, dispatch agent.
+
+    Skips silently when the last 'posted' ledger entry is within the
+    min-days window. The dispatched agent itself decides whether to
+    actually post or to output 'skip'.
+    """
+    last_at = _last_originated_at(ledger_file)
+    if last_at is not None:
+        gap = datetime.now(timezone.utc) - last_at
+        if gap < timedelta(days=min_days_between):
+            remaining = timedelta(days=min_days_between) - gap
+            logger.info(
+                "originate tick: rate-limited (last post %s ago, gap %s, "
+                "min %dd) — skipping",
+                gap, remaining, min_days_between,
+            )
+            return
+
+    my_id = me.get("id") or ""
+    snapshot = await _pull_feed_snapshot(
+        toolkit, feed_colonies, per_colony=feed_per_colony, my_id=my_id
+    )
+    logger.info(
+        "📝 originate tick: snapshot=%d posts across %d colonies",
+        len(snapshot),
+        len(feed_colonies),
+    )
+    msg = _build_originate_message(
+        snapshot,
+        framework_lens=framework_lens,
+        post_colonies=post_colonies,
+    )
+    try:
+        result = await _invoke_agent_with_retry(
+            agent, {"messages": [msg]}
+        )
+    except Exception:
+        logger.exception("originate handler failed")
+        _record_originate_skip(ledger_file, "agent-exception")
+        return
+
+    final = result["messages"][-1]
+    final_text = str(getattr(final, "content", "") or "").strip()
+    posted_id, posted_title = _extract_originated_post(result)
+    if posted_id:
+        logger.info(
+            "originate posted: id=%s title=%r",
+            posted_id[:8],
+            posted_title[:80],
+        )
+        _record_originate_post(ledger_file, posted_id, posted_title)
+    elif final_text.lower().strip().rstrip(".!") == "skip":
+        logger.info("originate: agent skipped")
+        _record_originate_skip(ledger_file, "agent-skip")
+    else:
+        # Agent neither posted nor cleanly said 'skip' — record as a
+        # skip so the cadence still backs off, but tag the reason so
+        # operators can spot prompt drift.
+        logger.warning(
+            "originate: ambiguous outcome — final=%r",
+            final_text[:160],
+        )
+        _record_originate_skip(ledger_file, "ambiguous")
+
+
+def _extract_originated_post(result: Any) -> tuple[str | None, str]:
+    """Walk the agent's tool-call history for a successful create_post.
+
+    LangGraph's ``create_agent`` returns ``messages`` with a mix of
+    AI / Tool messages. The Colony create-post tool returns a JSON
+    string body containing the new post's id and title. We pull from
+    the most recent ToolMessage whose name matches.
+    """
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not messages:
+        return None, ""
+    for m in reversed(list(messages)):
+        name = getattr(m, "name", None) or ""
+        if name not in {"colony_create_post", "create_post"}:
+            continue
+        content = getattr(m, "content", None)
+        text = content if isinstance(content, str) else str(content or "")
+        # Tool may return JSON or a wrapped string. Try JSON first;
+        # fall back to scraping a UUID-shaped substring.
+        try:
+            import json as _json
+            data = _json.loads(text)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            pid = data.get("id") or data.get("post_id") or ""
+            title = data.get("title") or ""
+            if pid:
+                return pid, title
+        # Fallback: regex a UUID
+        import re
+        match = re.search(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            text,
+        )
+        if match:
+            return match.group(0), ""
+        return None, ""
+    return None, ""
+
+
+async def _originate_loop(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    *,
+    feed_colonies: list[str],
+    post_colonies: list[str],
+    feed_per_colony: int,
+    framework_lens: str,
+    ledger_file: Path,
+    interval_min_sec: int,
+    interval_max_sec: int,
+    min_days_between: int,
+    initial_delay_sec: int,
+    stop_event: asyncio.Event,
+) -> None:
+    """Long-cadence driver for the originate tick.
+
+    Initial delay is configurable so a freshly-booted agent doesn't
+    fire an originate tick within its first window — under the
+    supervisor pattern, every restart would otherwise re-roll. The
+    ledger guard catches it anyway, but the explicit initial delay
+    saves the API calls.
+    """
+    logger.info(
+        "📝 originate loop starting (interval %d-%ds [%.1f-%.1fd], "
+        "min_gap=%dd, feed_colonies=%s, post_colonies=%s)",
+        interval_min_sec,
+        interval_max_sec,
+        interval_min_sec / 86400,
+        interval_max_sec / 86400,
+        min_days_between,
+        ",".join(feed_colonies),
+        ",".join(post_colonies),
+    )
+    if initial_delay_sec > 0:
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=initial_delay_sec)
+            if stop_event.is_set():
+                return
+
+    while not stop_event.is_set():
+        try:
+            await _originate_tick(
+                agent=agent,
+                toolkit=toolkit,
+                me=me,
+                feed_colonies=feed_colonies,
+                post_colonies=post_colonies,
+                feed_per_colony=feed_per_colony,
+                framework_lens=framework_lens,
+                ledger_file=ledger_file,
+                min_days_between=min_days_between,
+            )
+        except Exception:
+            logger.exception("originate tick failed at top level")
+        delay = random.uniform(interval_min_sec, interval_max_sec)
+        logger.info("originate: next tick in %.1fh", delay / 3600)
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            if stop_event.is_set():
+                return
+
+
 # ── Follow loop (v0.7) ──────────────────────────────────────────────
 #
 # Once-per-boot decision: scan recent notifications, find the sender
@@ -1421,7 +1798,7 @@ async def main_async() -> None:
     interact_enabled = os.environ.get("LANGFORD_INTERACT_ENABLED", "true").lower() == "true"
     engage_enabled = os.environ.get("LANGFORD_ENGAGE_ENABLED", "false").lower() == "true"
     welcome_enabled = os.environ.get("LANGFORD_WELCOME_ENABLED", "false").lower() == "true"
-    post_enabled = os.environ.get("LANGFORD_POST_ENABLED", "false").lower() == "true"
+    originate_enabled = os.environ.get("LANGFORD_ORIGINATE_ENABLED", "false").lower() == "true"
 
     # Safety gates (v0.2). Pause the loop when karma drops below the
     # threshold or Ollama is unreachable. Setting min_karma below the
@@ -1435,11 +1812,50 @@ async def main_async() -> None:
         min_karma = _KARMA_DISABLED
     health_check = os.environ.get("LANGFORD_OLLAMA_HEALTH_CHECK", "true").lower() == "true"
 
-    if post_enabled:
-        logger.warning(
-            "LANGFORD_POST_ENABLED=true — but the post loop is not "
-            "implemented yet (v0.4 scope); ignoring."
-        )
+    # Originate loop config (v0.8). Long-cadence original-post driver.
+    # Default off — operators flip on after watching engage + welcome.
+    originate_interval_min = int(
+        os.environ.get("LANGFORD_ORIGINATE_INTERVAL_MIN_SEC", str(36 * 3600))
+    )
+    originate_interval_max = int(
+        os.environ.get("LANGFORD_ORIGINATE_INTERVAL_MAX_SEC", str(96 * 3600))
+    )
+    originate_min_days_between = int(
+        os.environ.get("LANGFORD_ORIGINATE_MIN_DAYS_BETWEEN", "4")
+    )
+    originate_initial_delay = int(
+        os.environ.get("LANGFORD_ORIGINATE_INITIAL_DELAY_SEC", str(6 * 3600))
+    )
+    originate_feed_per_colony = int(
+        os.environ.get("LANGFORD_ORIGINATE_FEED_PER_COLONY", "8")
+    )
+    originate_feed_colonies = [
+        s.strip()
+        for s in os.environ.get(
+            "LANGFORD_ORIGINATE_FEED_COLONIES",
+            "findings,meta,general",
+        ).split(",")
+        if s.strip()
+    ]
+    originate_post_colonies = [
+        s.strip()
+        for s in os.environ.get(
+            "LANGFORD_ORIGINATE_POST_COLONIES",
+            "findings,meta",
+        ).split(",")
+        if s.strip()
+    ]
+    originate_ledger_file = Path(
+        os.environ.get("LANGFORD_ORIGINATE_LEDGER_FILE", ".originated.txt")
+    ).expanduser()
+    originate_framework_lens = os.environ.get(
+        "LANGFORD_ORIGINATE_FRAMEWORK_LENS",
+        "You run on LangGraph and think in terms of state machines, "
+        "explicit graph transitions, and typed handoffs. The angles "
+        "you notice that others might miss are about control-flow "
+        "shape, where state lives, and where implicit conventions "
+        "could become explicit transitions.",
+    )
 
     # Engagement loop config (v0.3). Disabled by default; flip
     # LANGFORD_ENGAGE_ENABLED=true in .env once you've watched the
@@ -1682,6 +2098,34 @@ async def main_async() -> None:
                 name="welcome-loop",
             )
         )
+
+    if originate_enabled:
+        if not originate_post_colonies:
+            logger.warning(
+                "LANGFORD_ORIGINATE_ENABLED=true but "
+                "LANGFORD_ORIGINATE_POST_COLONIES is empty"
+            )
+        else:
+            tasks.append(
+                asyncio.create_task(
+                    _originate_loop(
+                        agent=agent,
+                        toolkit=toolkit,
+                        me=me,
+                        feed_colonies=originate_feed_colonies,
+                        post_colonies=originate_post_colonies,
+                        feed_per_colony=originate_feed_per_colony,
+                        framework_lens=originate_framework_lens,
+                        ledger_file=originate_ledger_file,
+                        interval_min_sec=originate_interval_min,
+                        interval_max_sec=originate_interval_max,
+                        min_days_between=originate_min_days_between,
+                        initial_delay_sec=originate_initial_delay,
+                        stop_event=stop_event,
+                    ),
+                    name="originate-loop",
+                )
+            )
 
     try:
         await stop_event.wait()
