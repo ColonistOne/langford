@@ -1138,12 +1138,63 @@ async def _originate_tick(
     else:
         # Agent neither posted nor cleanly said 'skip' — record as a
         # skip so the cadence still backs off, but tag the reason so
-        # operators can spot prompt drift.
+        # operators can spot prompt drift. Dump the message trace so we
+        # can see what the model actually did (tool calls, empty
+        # finals, qwen non-canonical skip phrasings, etc.).
         logger.warning(
             "originate: ambiguous outcome — final=%r",
             final_text[:160],
         )
+        _log_message_trace(result)
         _record_originate_skip(ledger_file, "ambiguous")
+
+
+def _log_message_trace(result: Any) -> None:
+    """Best-effort dump of a LangGraph result's message list.
+
+    Only used for ambiguous-outcome diagnostics. Each line is a
+    one-line summary of one message: index, type, name (if tool),
+    tool_calls count, content excerpt.
+    """
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not messages:
+        logger.warning("originate trace: no messages in result")
+        return
+    for i, m in enumerate(messages):
+        kind = type(m).__name__
+        name = getattr(m, "name", None)
+        content = getattr(m, "content", None)
+        tool_calls = getattr(m, "tool_calls", None) or []
+        if isinstance(content, str):
+            preview = content
+        elif isinstance(content, list):
+            # Some chat models emit content as list of blocks
+            try:
+                preview = " | ".join(
+                    str(b.get("text") if isinstance(b, dict) else b)
+                    for b in content
+                )
+            except Exception:
+                preview = repr(content)
+        else:
+            preview = repr(content)
+        preview = (preview or "").replace("\n", " ")[:200]
+        tc_summary = ""
+        if tool_calls:
+            try:
+                tc_summary = " tool_calls=" + ",".join(
+                    tc.get("name", "?") for tc in tool_calls
+                )
+            except Exception:
+                tc_summary = f" tool_calls={len(tool_calls)}"
+        logger.warning(
+            "originate trace [%d] %s%s%s content=%r",
+            i,
+            kind,
+            f" name={name}" if name else "",
+            tc_summary,
+            preview,
+        )
 
 
 def _extract_originated_post(result: Any) -> tuple[str | None, str]:
@@ -1885,13 +1936,17 @@ async def main_async() -> None:
         os.environ.get("LANGFORD_WELCOMED_POSTS_FILE", ".welcomed-posts.txt")
     ).expanduser()
 
-    # num_predict caps output tokens. Ollama's default is 128 which
-    # truncates anything substantive — early Langford DMs read like
-    # one-line acknowledgements purely because of this. Bumping the
-    # default lets the system prompt's length guidance actually take
-    # effect. Per-tick latency rises with the cap; 1024 keeps cold
-    # tool-calling rounds under ~60s on qwen3.6:27b on a 3090.
-    max_output_tokens = int(os.environ.get("LANGFORD_MAX_OUTPUT_TOKENS", "1024"))
+    # num_predict caps output tokens. Ollama's default of 128 truncates
+    # anything substantive. qwen3.6 has thinking mode enabled by default
+    # and burns its budget inside <think> blocks before reaching the
+    # final answer — at 1024 the originate decision came back as an
+    # empty AIMessage (v0.8 dry-run, 2026-05-01). 4096 gives qwen room
+    # to think AND emit a final answer or tool call. Reactive paths
+    # rarely use more than ~500-1000 tokens of actual output, so the
+    # extra cap doesn't change typical latency; only worst-case rounds
+    # slow down. Per-call num_predict can still be overridden via bind()
+    # for special cases (e.g. the auto-vote scorer at num_predict=20).
+    max_output_tokens = int(os.environ.get("LANGFORD_MAX_OUTPUT_TOKENS", "4096"))
     temperature = float(os.environ.get("LANGFORD_TEMPERATURE", "0.7"))
 
     logger.info(

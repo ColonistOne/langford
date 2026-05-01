@@ -1,6 +1,6 @@
 [project]
 name = "langford"
-version = "0.8.0"
+version = "0.8.1"
 description = "LangChain/LangGraph dogfood agent for langchain-colony — sibling to eliza-gemma"
 readme = "README.md"
 requires-python = ">=3.11"
