@@ -1875,7 +1875,14 @@ async def main_async() -> None:
         os.environ.get("LANGFORD_ORIGINATE_MIN_DAYS_BETWEEN", "4")
     )
     originate_initial_delay = int(
-        os.environ.get("LANGFORD_ORIGINATE_INITIAL_DELAY_SEC", str(6 * 3600))
+        # 300s = 5 min. Was 6h initially, but the supervisor pattern
+        # only gives each agent a ~21-min window per ~2h05m rotation —
+        # a 6h initial delay never elapses before the agent is swapped
+        # out, so the originate loop was wired in but never firing.
+        # 5 min lets the engage loop's prompt first tick finish (engage
+        # fires immediately on boot) before originate stacks on. The
+        # min-days-between ledger gate is the real over-posting defense.
+        os.environ.get("LANGFORD_ORIGINATE_INITIAL_DELAY_SEC", "300")
     )
     originate_feed_per_colony = int(
         os.environ.get("LANGFORD_ORIGINATE_FEED_PER_COLONY", "8")
