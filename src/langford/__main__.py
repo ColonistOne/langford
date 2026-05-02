@@ -43,7 +43,7 @@ logger = logging.getLogger("langford")
 
 # Sentinel below any plausible karma value — disables the auto-pause
 # entirely. Negative because karma can legitimately be below 0.
-_KARMA_DISABLED = -10**6
+_KARMA_DISABLED = -(10**6)
 
 
 def _is_transient_ollama_error(exc: BaseException) -> bool:
@@ -97,6 +97,7 @@ async def _invoke_agent_with_retry(
             await asyncio.sleep(delay)
     assert last_exc is not None  # unreachable
     raise last_exc
+
 
 SYSTEM_PROMPT = """\
 You are Langford, an AI agent on The Colony (thecolony.cc) — a social
@@ -277,7 +278,7 @@ def _build_event_message(
             "RESPONSE THREADING (CRITICAL): a Comment id is set on this "
             "notification, which means you are replying to a specific "
             "comment. When you call colony_comment_on_post, you MUST "
-            f"pass parent_comment_id=\"{notif.comment_id}\". Without "
+            f'pass parent_comment_id="{notif.comment_id}". Without '
             "parent_comment_id the response posts as a TOP-LEVEL comment "
             "on the post — that is forbidden because top-level comments "
             "are reserved for first-encounter engagement and any further "
@@ -469,7 +470,11 @@ async def _engage_tick(
         except Exception as exc:
             logger.warning("engage: get_posts(%s) failed: %s", slug, exc)
             continue
-        items = data if isinstance(data, list) else (data.get("items") or data.get("posts") or [])
+        items = (
+            data
+            if isinstance(data, list)
+            else (data.get("items") or data.get("posts") or [])
+        )
         candidate = None
         for post in items:
             pid = post.get("id")
@@ -497,7 +502,9 @@ async def _engage_tick(
                 logger.warning("failed to persist seen post id: %s", exc)
         comments_data = {}
         try:
-            comments_data = await asyncio.to_thread(toolkit.client.get_comments, candidate["id"])
+            comments_data = await asyncio.to_thread(
+                toolkit.client.get_comments, candidate["id"]
+            )
         except Exception as exc:
             logger.debug("engage: get_comments failed: %s", exc)
         comments = (
@@ -556,7 +563,11 @@ async def _engage_loop(
     seen_ids: set[str] = set()
     if seen_file is not None and seen_file.exists():
         try:
-            seen_ids = {line.strip() for line in seen_file.read_text().splitlines() if line.strip()}
+            seen_ids = {
+                line.strip()
+                for line in seen_file.read_text().splitlines()
+                if line.strip()
+            }
             logger.info("loaded %d seen post ids from %s", len(seen_ids), seen_file)
         except OSError as exc:
             logger.warning("failed to load seen file: %s", exc)
@@ -620,7 +631,9 @@ def _parse_iso_utc(s: str | None) -> datetime | None:
         return None
 
 
-def _build_welcome_message(post: dict, comments: list[dict], author: dict) -> HumanMessage:
+def _build_welcome_message(
+    post: dict, comments: list[dict], author: dict
+) -> HumanMessage:
     """Frame an introductions-colony candidate for the welcome agent.
 
     Constrains the agent to a single action: comment a brief specific
@@ -737,7 +750,11 @@ async def _welcome_tick(
     except Exception as exc:
         logger.warning("welcome: get_posts(introductions) failed: %s", exc)
         return
-    items = data if isinstance(data, list) else (data.get("items") or data.get("posts") or [])
+    items = (
+        data
+        if isinstance(data, list)
+        else (data.get("items") or data.get("posts") or [])
+    )
     my_id = me.get("id") or ""
     my_username = me.get("username")
 
@@ -813,9 +830,7 @@ async def _welcome_tick(
             logger.exception("welcome handler failed")
         return
 
-    logger.info(
-        "welcome tick: no eligible candidates (scanned %d intros)", len(items)
-    )
+    logger.info("welcome tick: no eligible candidates (scanned %d intros)", len(items))
 
 
 async def _welcome_loop(
@@ -1038,7 +1053,7 @@ def _build_originate_message(
             "CALL colony_create_post(colony=<one of: "
             + ", ".join(f'"{c}"' for c in post_colonies)
             + ">, title=<a 6-12-word specific phrase>, body=<3-6 short "
-            "paragraphs>, post_type=\"discussion\") and stop.",
+            'paragraphs>, post_type="discussion") and stop.',
             "",
             "  * Otherwise — output the EXACT text 'skip' as your final "
             "message and stop. Do NOT call any tool. Skip is the right "
@@ -1095,7 +1110,9 @@ async def _originate_tick(
             logger.info(
                 "originate tick: rate-limited (last post %s ago, gap %s, "
                 "min %dd) — skipping",
-                gap, remaining, min_days_between,
+                gap,
+                remaining,
+                min_days_between,
             )
             return
 
@@ -1114,9 +1131,7 @@ async def _originate_tick(
         post_colonies=post_colonies,
     )
     try:
-        result = await _invoke_agent_with_retry(
-            agent, {"messages": [msg]}
-        )
+        result = await _invoke_agent_with_retry(agent, {"messages": [msg]})
     except Exception:
         logger.exception("originate handler failed")
         _record_originate_skip(ledger_file, "agent-exception")
@@ -1171,8 +1186,7 @@ def _log_message_trace(result: Any) -> None:
             # Some chat models emit content as list of blocks
             try:
                 preview = " | ".join(
-                    str(b.get("text") if isinstance(b, dict) else b)
-                    for b in content
+                    str(b.get("text") if isinstance(b, dict) else b) for b in content
                 )
             except Exception:
                 preview = repr(content)
@@ -1218,6 +1232,7 @@ def _extract_originated_post(result: Any) -> tuple[str | None, str]:
         # fall back to scraping a UUID-shaped substring.
         try:
             import json as _json
+
             data = _json.loads(text)
         except (ValueError, TypeError):
             data = None
@@ -1228,6 +1243,7 @@ def _extract_originated_post(result: Any) -> tuple[str | None, str]:
                 return pid, title
         # Fallback: regex a UUID
         import re
+
         match = re.search(
             r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
             text,
@@ -1318,11 +1334,7 @@ def _load_followed(file: Path) -> set[str]:
     if not file.exists():
         return set()
     try:
-        return {
-            line.strip()
-            for line in file.read_text().splitlines()
-            if line.strip()
-        }
+        return {line.strip() for line in file.read_text().splitlines() if line.strip()}
     except OSError:
         return set()
 
@@ -1333,9 +1345,7 @@ def _count_today_follows(log_file: Path) -> int:
     today = _today_iso_utc()
     try:
         return sum(
-            1
-            for line in log_file.read_text().splitlines()
-            if line.startswith(today)
+            1 for line in log_file.read_text().splitlines() if line.startswith(today)
         )
     except OSError:
         return 0
@@ -1490,8 +1500,7 @@ async def _maybe_follow_someone(
     ]
     if not candidates:
         logger.info(
-            "follow: no candidates (followed=%d, distinct senders=%d, "
-            "threshold=%d)",
+            "follow: no candidates (followed=%d, distinct senders=%d, threshold=%d)",
             len(followed),
             len(sender_counts),
             min_interactions,
@@ -1531,7 +1540,9 @@ async def _maybe_follow_someone(
     if not target_uid:
         # Fallback: directory lookup by username.
         try:
-            data = await asyncio.to_thread(toolkit.client.directory, query=top_user, limit=5)
+            data = await asyncio.to_thread(
+                toolkit.client.directory, query=top_user, limit=5
+            )
             users = data.get("items") if isinstance(data, dict) else (data or [])
             for u in users or []:
                 if u.get("username") == top_user:
@@ -1636,7 +1647,9 @@ async def _delete_comment_via_api(toolkit: ColonyToolkit, comment_id: str) -> bo
         with urllib.request.urlopen(req, timeout=10) as r:
             return 200 <= r.status < 300
     except urllib.error.HTTPError as exc:
-        logger.warning("delete_comment %s failed: HTTP %d %s", comment_id, exc.code, exc.reason)
+        logger.warning(
+            "delete_comment %s failed: HTTP %d %s", comment_id, exc.code, exc.reason
+        )
         return False
     except Exception as exc:
         logger.warning("delete_comment %s failed: %s", comment_id, exc)
@@ -1661,17 +1674,30 @@ async def _handle_event(
     )
 
     # v0.6.1: post-level dedupe + v0.6.2: parent-comment pre-load and
-    # top-level-already-posted directive. One get_comments call up
-    # front; reuse for all three checks plus the post-dispatch
-    # validator at the bottom of this function.
+    # top-level-already-posted directive + v0.9.0: nested-reply dedupe.
+    # One get_comments call up front; reuse for all four checks plus
+    # the post-dispatch validator at the bottom of this function.
     pre_dispatch_comments: list[dict] = []
     self_top_level_count = 0
+    self_reply_parents: set[str] = set()
     parent_comment_body: str | None = None
     if toolkit is not None and self_username and notif.post_id:
         (
             pre_dispatch_comments,
             self_top_level_count,
         ) = await _self_comments_on_post(toolkit, notif.post_id, self_username)
+
+        # v0.9.0: parent_ids self has already replied to on this post.
+        # Used to short-circuit re-fired notifications that would
+        # otherwise produce a paired duplicate reply ~90s after the
+        # first (observed 2026-05-02, three pairs on post b32f5bd6),
+        # and to catch the same shape post-dispatch.
+        self_reply_parents = {
+            c["parent_id"]
+            for c in pre_dispatch_comments
+            if (c.get("author") or {}).get("username") == self_username
+            and c.get("parent_id")
+        }
 
         # v0.6.1 dedupe: post-level event with no specific target comment
         # and we already replied? Skip.
@@ -1688,6 +1714,17 @@ async def _handle_event(
                 "(type=%s, no comment_id)",
                 notif.post_id,
                 notif.notification_type,
+            )
+            return
+
+        # v0.9.0 dedupe: notification targets a specific comment we've
+        # already replied to. Re-fired notification → would have
+        # produced a paired duplicate reply. Skip.
+        if notif.comment_id is not None and notif.comment_id in self_reply_parents:
+            logger.info(
+                "skipping dispatch: self already replied to comment %s on post %s",
+                notif.comment_id,
+                notif.post_id,
             )
             return
 
@@ -1761,17 +1798,26 @@ async def _handle_event(
         logger.exception("event handler failed (type=%s)", notif.notification_type)
         return
 
-    # v0.6.2 post-dispatch validator: if the agent posted a top-level
-    # comment despite the prompt directives — and we already had at
-    # least one top-level Langford comment on this post going in —
-    # delete the new dupe before it lands in the public record.
+    # v0.6.2 + v0.9.0 post-dispatch validator: delete new self-comments
+    # that match any of three failure modes:
+    #   1. New top-level when self already had ≥1 top-level (v0.6.2).
+    #   2. New top-level when notif targeted a specific comment_id —
+    #      agent went top-level instead of threaded (v0.9.0; observed
+    #      2026-05-02, comment 7d2f11c6 on post b32f5bd6).
+    #   3. New nested reply under a parent_id self had already replied
+    #      to — paired duplicate from a re-fired notification (v0.9.0;
+    #      observed 2026-05-02, three pairs on post b32f5bd6).
     # 15-min author-delete window applies; this fires within seconds
     # of dispatch so it's well inside that bound.
     if (
         toolkit is not None
         and self_username
         and notif.post_id
-        and self_top_level_count >= 1
+        and (
+            self_top_level_count >= 1
+            or notif.comment_id is not None
+            or self_reply_parents
+        )
     ):
         try:
             post_dispatch_comments, _new_top_level_count = await _self_comments_on_post(
@@ -1779,30 +1825,42 @@ async def _handle_event(
             )
         except Exception:
             post_dispatch_comments = []
-        # Pick out new self top-level comments (those not present
-        # before dispatch). Compare by id.
         prior_self_ids = {
             c.get("id")
             for c in pre_dispatch_comments
             if (c.get("author") or {}).get("username") == self_username
         }
-        new_self_top_level = [
-            c
-            for c in post_dispatch_comments
-            if (c.get("author") or {}).get("username") == self_username
-            and not c.get("parent_id")
-            and c.get("id") not in prior_self_ids
-        ]
-        for c in new_self_top_level:
+        for c in post_dispatch_comments:
+            if (c.get("author") or {}).get("username") != self_username:
+                continue
             cid = c.get("id")
-            if not cid:
+            if not cid or cid in prior_self_ids:
+                continue
+            new_parent = c.get("parent_id")
+            reason: str | None = None
+            if new_parent is None:
+                if self_top_level_count >= 1:
+                    reason = (
+                        f"new top-level dupe (post already had "
+                        f"{self_top_level_count} top-level by self)"
+                    )
+                elif notif.comment_id is not None:
+                    reason = (
+                        f"new top-level but notif targeted comment "
+                        f"{notif.comment_id} (mis-thread)"
+                    )
+            elif new_parent in self_reply_parents:
+                reason = (
+                    f"new nested reply under parent {new_parent} "
+                    f"(self already replied there — paired duplicate)"
+                )
+            if reason is None:
                 continue
             logger.warning(
-                "post-dispatch: deleting new top-level dupe comment %s "
-                "(post %s already had %d top-level by self)",
+                "post-dispatch: deleting %s — %s (post %s)",
                 cid,
+                reason,
                 notif.post_id,
-                self_top_level_count,
             )
             ok = await _delete_comment_via_api(toolkit, cid)
             logger.info(
@@ -1846,10 +1904,18 @@ async def main_async() -> None:
     ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     ollama_model = os.environ.get("OLLAMA_MODEL", "qwen3.6:27b")
     poll_interval = int(os.environ.get("LANGFORD_POLL_INTERVAL_SEC", "120"))
-    interact_enabled = os.environ.get("LANGFORD_INTERACT_ENABLED", "true").lower() == "true"
-    engage_enabled = os.environ.get("LANGFORD_ENGAGE_ENABLED", "false").lower() == "true"
-    welcome_enabled = os.environ.get("LANGFORD_WELCOME_ENABLED", "false").lower() == "true"
-    originate_enabled = os.environ.get("LANGFORD_ORIGINATE_ENABLED", "false").lower() == "true"
+    interact_enabled = (
+        os.environ.get("LANGFORD_INTERACT_ENABLED", "true").lower() == "true"
+    )
+    engage_enabled = (
+        os.environ.get("LANGFORD_ENGAGE_ENABLED", "false").lower() == "true"
+    )
+    welcome_enabled = (
+        os.environ.get("LANGFORD_WELCOME_ENABLED", "false").lower() == "true"
+    )
+    originate_enabled = (
+        os.environ.get("LANGFORD_ORIGINATE_ENABLED", "false").lower() == "true"
+    )
 
     # Safety gates (v0.2). Pause the loop when karma drops below the
     # threshold or Ollama is unreachable. Setting min_karma below the
@@ -1859,9 +1925,13 @@ async def main_async() -> None:
     try:
         min_karma = int(min_karma_raw)
     except ValueError:
-        logger.warning("LANGFORD_MIN_KARMA=%r is not an int — disabling karma gate", min_karma_raw)
+        logger.warning(
+            "LANGFORD_MIN_KARMA=%r is not an int — disabling karma gate", min_karma_raw
+        )
         min_karma = _KARMA_DISABLED
-    health_check = os.environ.get("LANGFORD_OLLAMA_HEALTH_CHECK", "true").lower() == "true"
+    health_check = (
+        os.environ.get("LANGFORD_OLLAMA_HEALTH_CHECK", "true").lower() == "true"
+    )
 
     # Originate loop config (v0.8). Long-cadence original-post driver.
     # Default off — operators flip on after watching engage + welcome.
@@ -1920,12 +1990,18 @@ async def main_async() -> None:
     # reactive loop behave for a while.
     engage_colonies = [
         s.strip()
-        for s in os.environ.get("LANGFORD_ENGAGE_COLONIES", "findings,meta,builds,general").split(",")
+        for s in os.environ.get(
+            "LANGFORD_ENGAGE_COLONIES", "findings,meta,builds,general"
+        ).split(",")
         if s.strip()
     ]
     engage_interval_min = int(os.environ.get("LANGFORD_ENGAGE_INTERVAL_MIN_SEC", "900"))
-    engage_interval_max = int(os.environ.get("LANGFORD_ENGAGE_INTERVAL_MAX_SEC", "2700"))
-    engage_candidate_limit = int(os.environ.get("LANGFORD_ENGAGE_CANDIDATE_LIMIT", "10"))
+    engage_interval_max = int(
+        os.environ.get("LANGFORD_ENGAGE_INTERVAL_MAX_SEC", "2700")
+    )
+    engage_candidate_limit = int(
+        os.environ.get("LANGFORD_ENGAGE_CANDIDATE_LIMIT", "10")
+    )
     seen_posts_file = Path(
         os.environ.get("LANGFORD_SEEN_POSTS_FILE", ".engaged-posts.txt")
     ).expanduser()
@@ -1934,11 +2010,21 @@ async def main_async() -> None:
     # c/introductions posts and welcomes new agents (recently joined,
     # low karma) with a brief, specific comment. Independent cadence
     # from the engage loop; defaults match its 15-45 min jitter.
-    welcome_interval_min = int(os.environ.get("LANGFORD_WELCOME_INTERVAL_MIN_SEC", "900"))
-    welcome_interval_max = int(os.environ.get("LANGFORD_WELCOME_INTERVAL_MAX_SEC", "2700"))
-    welcome_candidate_limit = int(os.environ.get("LANGFORD_WELCOME_CANDIDATE_LIMIT", "15"))
-    welcome_new_agent_max_days = int(os.environ.get("LANGFORD_WELCOME_NEW_AGENT_MAX_DAYS", "14"))
-    welcome_new_agent_max_karma = int(os.environ.get("LANGFORD_WELCOME_NEW_AGENT_MAX_KARMA", "50"))
+    welcome_interval_min = int(
+        os.environ.get("LANGFORD_WELCOME_INTERVAL_MIN_SEC", "900")
+    )
+    welcome_interval_max = int(
+        os.environ.get("LANGFORD_WELCOME_INTERVAL_MAX_SEC", "2700")
+    )
+    welcome_candidate_limit = int(
+        os.environ.get("LANGFORD_WELCOME_CANDIDATE_LIMIT", "15")
+    )
+    welcome_new_agent_max_days = int(
+        os.environ.get("LANGFORD_WELCOME_NEW_AGENT_MAX_DAYS", "14")
+    )
+    welcome_new_agent_max_karma = int(
+        os.environ.get("LANGFORD_WELCOME_NEW_AGENT_MAX_KARMA", "50")
+    )
     welcomed_posts_file = Path(
         os.environ.get("LANGFORD_WELCOMED_POSTS_FILE", ".welcomed-posts.txt")
     ).expanduser()
@@ -1998,7 +2084,9 @@ async def main_async() -> None:
     peer_store: JSONFilePeerMemoryStore | None = None
     if os.environ.get("LANGFORD_PEER_MEMORY_ENABLED", "false").lower() == "true":
         if not self_username:
-            logger.warning("LANGFORD_PEER_MEMORY_ENABLED=true but get_me() returned no username — disabling")
+            logger.warning(
+                "LANGFORD_PEER_MEMORY_ENABLED=true but get_me() returned no username — disabling"
+            )
         else:
             peer_path = Path(
                 os.environ.get(
@@ -2012,7 +2100,9 @@ async def main_async() -> None:
         logger.info("peer-memory: disabled (LANGFORD_PEER_MEMORY_ENABLED!=true)")
 
     auto_voter: AutoVoter | None = None
-    auto_vote_enabled = os.environ.get("LANGFORD_AUTO_VOTE_ENABLED", "false").lower() == "true"
+    auto_vote_enabled = (
+        os.environ.get("LANGFORD_AUTO_VOTE_ENABLED", "false").lower() == "true"
+    )
     if auto_vote_enabled:
         auto_downvote_enabled = (
             os.environ.get("LANGFORD_AUTO_DOWNVOTE_ENABLED", "false").lower() == "true"
@@ -2081,7 +2171,9 @@ async def main_async() -> None:
 
     # v0.7: per-boot follow tick. Fires once before loops start. Off by
     # default; flipped on in local .env per operator decision.
-    follow_enabled = os.environ.get("LANGFORD_FOLLOW_ENABLED", "false").lower() == "true"
+    follow_enabled = (
+        os.environ.get("LANGFORD_FOLLOW_ENABLED", "false").lower() == "true"
+    )
     if follow_enabled and self_username:
         followed_file = Path(
             os.environ.get("LANGFORD_FOLLOWED_FILE", ".followed-users.txt")
@@ -2123,7 +2215,9 @@ async def main_async() -> None:
 
     if engage_enabled:
         if not engage_colonies:
-            logger.warning("LANGFORD_ENGAGE_ENABLED=true but LANGFORD_ENGAGE_COLONIES is empty")
+            logger.warning(
+                "LANGFORD_ENGAGE_ENABLED=true but LANGFORD_ENGAGE_COLONIES is empty"
+            )
         else:
             tasks.append(
                 asyncio.create_task(
