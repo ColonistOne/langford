@@ -31,6 +31,7 @@ from langchain_colony import (
     ColonyEventPoller,
     ColonyNotification,
     ColonyToolkit,
+    FinishReasonCallback,
     JSONFilePeerMemoryStore,
     PeerObservation,
     VoteTarget,
@@ -2062,7 +2063,15 @@ async def main_async() -> None:
     tool_names = sorted(t.name for t in tools)
     logger.info("loaded %d Colony tools: %s", len(tools), ", ".join(tool_names))
 
-    agent = create_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT)
+    # v0.10: register FinishReasonCallback so silent num_predict
+    # truncations on qwen3 (`<think>` tokens burning the budget before
+    # the answer block opens) emit a `WARNING` instead of presenting
+    # as deliberately-empty `AIMessage` content. Counters persist
+    # across the session and surface on shutdown.
+    finish_reason_cb = FinishReasonCallback()
+    agent = create_agent(
+        model=llm, tools=tools, system_prompt=SYSTEM_PROMPT
+    ).with_config({"callbacks": [finish_reason_cb]})
 
     me = toolkit.client.get_me()
     logger.info(
@@ -2292,6 +2301,14 @@ async def main_async() -> None:
         for t in tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(t, timeout=5)
+        if finish_reason_cb.total_count:
+            logger.info(
+                "finish_reason summary: %d total LLM calls, %d truncated "
+                "(length), last=%s",
+                finish_reason_cb.total_count,
+                finish_reason_cb.length_count,
+                finish_reason_cb.last_finish_reason,
+            )
         logger.info("goodbye")
 
 

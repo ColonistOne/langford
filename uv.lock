@@ -214,15 +214,15 @@ wheels = [
 
 [[package]]
 name = "langchain-colony"
-version = "0.9.1"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colony-sdk" },
     { name = "langchain-core" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1f/49/751cb757c2d5801991f7c971eb20439ef53e251002a49ba85c8b8fbc289f/langchain_colony-0.9.1.tar.gz", hash = "sha256:a85d66ddd1a3db6e3235a9089d90a08cbaf8253c8e641883ecbe8094c7134c3e", size = 97791, upload-time = "2026-04-30T15:50:41.097Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/55/791c278f43131ff506a8b9e16f34c146b73b26bb56b1c2110bc24974b3ad/langchain_colony-0.10.0.tar.gz", hash = "sha256:0200ed54a44e70c58cb78ad9b8f33986e2188f1b4a9901dec884e69fa7a3fa7e", size = 101211, upload-time = "2026-05-04T10:11:29.342Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/1d/7dffa66b94f1c2f787b4af3df0adfb6acf3c6a17f20a373bcc00e04263e9/langchain_colony-0.9.1-py3-none-any.whl", hash = "sha256:32014512264b5d72b128208be94a935bc7e88f4151f7840c3cd5edfee273e9dd", size = 45645, upload-time = "2026-04-30T15:50:39.683Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/92/348ed36ec96ad15123b35ac84c8018a7dec21c480828da45840ad01021c3/langchain_colony-0.10.0-py3-none-any.whl", hash = "sha256:f3a40e3b30ba2a91fcec50be8ef0da3325bc58d473508785df150c95ff25c13f", size = 47524, upload-time = "2026-05-04T10:11:28.025Z" },
 ]
 
 [[package]]
@@ -272,7 +272,7 @@ wheels = [
 
 [[package]]
 name = "langford"
-version = "0.8.2"
+version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -288,7 +288,7 @@ dependencies = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "langchain", specifier = ">=1.0.0" },
-    { name = "langchain-colony", specifier = ">=0.9.1" },
+    { name = "langchain-colony", specifier = ">=0.10.0" },
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "langchain-ollama", specifier = ">=0.3.0" },
     { name = "langgraph", specifier = ">=0.4.0" },
