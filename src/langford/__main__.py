@@ -31,11 +31,14 @@ from langchain_colony import (
     ColonyEventPoller,
     ColonyNotification,
     ColonyToolkit,
+    DmPromptMode,
     FinishReasonCallback,
     JSONFilePeerMemoryStore,
     PeerObservation,
     VoteTarget,
+    apply_dm_prompt_mode,
     default_peer_memory_path,
+    parse_dm_prompt_mode,
 )
 from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
@@ -229,6 +232,7 @@ def _build_event_message(
     peer_context: str = "",
     parent_comment_body: str | None = None,
     self_already_commented_top_level: bool = False,
+    dm_prompt_mode: DmPromptMode = DmPromptMode.NONE,
 ) -> HumanMessage:
     """Turn a ColonyNotification into a HumanMessage for the agent.
 
@@ -240,6 +244,12 @@ def _build_event_message(
     from the peer-memory store. When non-empty it sits at the top of
     the message — before the notification metadata — so the model
     reads who-we're-talking-to before what-was-said.
+
+    v0.11: ``dm_prompt_mode`` selects an origin-conditional framing
+    preamble (``peer`` / ``adversarial`` / ``none``) that gets prepended
+    to the DM body before it lands in the agent's prompt. Applied only
+    when ``notif.notification_type == "direct_message"``; comments and
+    mentions are passed through unframed.
     """
     parts: list[str] = []
     if peer_context:
@@ -254,9 +264,15 @@ def _build_event_message(
         parts.append(f"Post id: {notif.post_id}")
     if notif.comment_id:
         parts.append(f"Comment id: {notif.comment_id}")
+    is_dm = notif.notification_type == "direct_message"
     if notif.body:
         parts.append("")
-        parts.append(f"Content:\n{notif.body}")
+        body = (
+            apply_dm_prompt_mode(notif.body, dm_prompt_mode)
+            if is_dm
+            else notif.body
+        )
+        parts.append(f"Content:\n{body}")
     elif notif.message:
         parts.append("")
         parts.append(f"Notification text: {notif.message}")
@@ -1665,6 +1681,7 @@ async def _handle_event(
     auto_voter: AutoVoter | None = None,
     peer_store: JSONFilePeerMemoryStore | None = None,
     self_username: str | None = None,
+    dm_prompt_mode: DmPromptMode = DmPromptMode.NONE,
 ) -> None:
     logger.info(
         "event type=%s sender=@%s post_id=%s comment_id=%s",
@@ -1789,6 +1806,7 @@ async def _handle_event(
                         peer_context=peer_context,
                         parent_comment_body=parent_comment_body,
                         self_already_commented_top_level=(self_top_level_count >= 1),
+                        dm_prompt_mode=dm_prompt_mode,
                     )
                 ]
             },
@@ -2151,6 +2169,12 @@ async def main_async() -> None:
 
     poller = ColonyEventPoller(api_key=api_key, mark_read=True)
 
+    # v0.11: DM-origin prompt framing. Read once at startup; pass the
+    # resolved mode into every event dispatch. Unknown env values fail
+    # closed to NONE (no preamble), so a typo here cannot crash boot.
+    dm_prompt_mode = parse_dm_prompt_mode(os.environ.get("COLONY_DM_PROMPT_MODE"))
+    logger.info("dm_prompt_mode: %s", dm_prompt_mode.value)
+
     @poller.on()
     async def on_event(notif: ColonyNotification) -> None:
         await _handle_event(
@@ -2160,6 +2184,7 @@ async def main_async() -> None:
             auto_voter=auto_voter,
             peer_store=peer_store,
             self_username=self_username,
+            dm_prompt_mode=dm_prompt_mode,
         )
 
     stop_event = asyncio.Event()
