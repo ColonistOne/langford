@@ -31,13 +31,16 @@ from langchain_colony import (
     ColonyEventPoller,
     ColonyNotification,
     ColonyToolkit,
+    CommentPromptMode,
     DmPromptMode,
     FinishReasonCallback,
     JSONFilePeerMemoryStore,
     PeerObservation,
     VoteTarget,
+    apply_comment_prompt_mode,
     apply_dm_prompt_mode,
     default_peer_memory_path,
+    parse_comment_prompt_mode,
     parse_dm_prompt_mode,
 )
 from langchain_core.messages import HumanMessage
@@ -233,6 +236,7 @@ def _build_event_message(
     parent_comment_body: str | None = None,
     self_already_commented_top_level: bool = False,
     dm_prompt_mode: DmPromptMode = DmPromptMode.NONE,
+    comment_prompt_mode: CommentPromptMode = CommentPromptMode.NONE,
 ) -> HumanMessage:
     """Turn a ColonyNotification into a HumanMessage for the agent.
 
@@ -248,8 +252,16 @@ def _build_event_message(
     v0.11: ``dm_prompt_mode`` selects an origin-conditional framing
     preamble (``peer`` / ``adversarial`` / ``none``) that gets prepended
     to the DM body before it lands in the agent's prompt. Applied only
-    when ``notif.notification_type == "direct_message"``; comments and
-    mentions are passed through unframed.
+    when ``notif.notification_type == "direct_message"``.
+
+    v0.12: ``comment_prompt_mode`` is the parallel lever for
+    agent-to-agent public comments — applied only when the notification
+    is a comment-type event AND ``notif.sender_user_type == "agent"``.
+    Human comments and own-author replies pass through unframed because
+    the anti-agreement cues in the peer preamble mis-fire on human
+    readers and on first-encounter mentions where no prior reply exists.
+    The DM and comment regimes are independent; a given dispatch will
+    apply at most one preamble.
     """
     parts: list[str] = []
     if peer_context:
@@ -265,13 +277,18 @@ def _build_event_message(
     if notif.comment_id:
         parts.append(f"Comment id: {notif.comment_id}")
     is_dm = notif.notification_type == "direct_message"
+    is_agent_comment = (
+        notif.notification_type in _COMMENT_FRAMING_TYPES
+        and notif.sender_user_type == "agent"
+    )
     if notif.body:
         parts.append("")
-        body = (
-            apply_dm_prompt_mode(notif.body, dm_prompt_mode)
-            if is_dm
-            else notif.body
-        )
+        if is_dm:
+            body = apply_dm_prompt_mode(notif.body, dm_prompt_mode)
+        elif is_agent_comment:
+            body = apply_comment_prompt_mode(notif.body, comment_prompt_mode)
+        else:
+            body = notif.body
         parts.append(f"Content:\n{body}")
     elif notif.message:
         parts.append("")
@@ -1596,6 +1613,11 @@ def _observation_kind_for(notif: ColonyNotification) -> str:
 
 _POST_LEVEL_DEDUP_TYPES = {"mention", "comment_on_post"}
 
+# Notification types whose payload body is an agent-authored comment we
+# may want to frame via COLONY_COMMENT_PROMPT_MODE. Mirrors the comment-
+# enrichment set in langchain_colony.events 0.12+ — keep in sync.
+_COMMENT_FRAMING_TYPES = {"mention", "reply", "reply_to_comment", "comment_on_post"}
+
 
 async def _self_comments_on_post(
     toolkit: ColonyToolkit,
@@ -1682,6 +1704,7 @@ async def _handle_event(
     peer_store: JSONFilePeerMemoryStore | None = None,
     self_username: str | None = None,
     dm_prompt_mode: DmPromptMode = DmPromptMode.NONE,
+    comment_prompt_mode: CommentPromptMode = CommentPromptMode.NONE,
 ) -> None:
     logger.info(
         "event type=%s sender=@%s post_id=%s comment_id=%s",
@@ -1807,6 +1830,7 @@ async def _handle_event(
                         parent_comment_body=parent_comment_body,
                         self_already_commented_top_level=(self_top_level_count >= 1),
                         dm_prompt_mode=dm_prompt_mode,
+                        comment_prompt_mode=comment_prompt_mode,
                     )
                 ]
             },
@@ -2175,6 +2199,15 @@ async def main_async() -> None:
     dm_prompt_mode = parse_dm_prompt_mode(os.environ.get("COLONY_DM_PROMPT_MODE"))
     logger.info("dm_prompt_mode: %s", dm_prompt_mode.value)
 
+    # v0.12: parallel lever for agent-to-agent public comments. Gated
+    # on sender_user_type == "agent" inside _build_event_message so
+    # human comments pass through unframed. Independent from
+    # dm_prompt_mode — operators may want different regimes per surface.
+    comment_prompt_mode = parse_comment_prompt_mode(
+        os.environ.get("COLONY_COMMENT_PROMPT_MODE")
+    )
+    logger.info("comment_prompt_mode: %s", comment_prompt_mode.value)
+
     @poller.on()
     async def on_event(notif: ColonyNotification) -> None:
         await _handle_event(
@@ -2185,6 +2218,7 @@ async def main_async() -> None:
             peer_store=peer_store,
             self_username=self_username,
             dm_prompt_mode=dm_prompt_mode,
+            comment_prompt_mode=comment_prompt_mode,
         )
 
     stop_event = asyncio.Event()
