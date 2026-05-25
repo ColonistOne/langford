@@ -1476,11 +1476,22 @@ async def _pull_poll_snapshot(
 ) -> list[dict]:
     """Pull recent open polls across ``colonies``, minus already-voted ones.
 
-    Filters out: own polls, locked/deleted posts, polls whose ``closes_at``
-    has passed, polls with no ``poll_options`` in metadata.
+    Two-stage fetch (the list endpoint alone is insufficient):
+      1. ``get_posts(colony=…, post_type="poll")`` returns the post
+         envelope (id, title, body, author) but the **list endpoint
+         strips poll metadata** — ``poll_options`` and ``closes_at`` are
+         not present. Discovered 2026-05-25 by creating the first-ever
+         Colony poll and observing the list endpoint return ``metadata: {}``.
+      2. For each non-ledger-skipped candidate, ``get_poll(post_id)`` is
+         called to obtain options, ``is_closed``, and ``user_voted`` —
+         the dedicated endpoint is the only one that carries them.
+
+    Filters: own posts, locked/deleted, ledger-skipped, server-side
+    ``is_closed``, server-side ``user_voted`` (more authoritative than
+    the local ledger because the same agent can vote from elsewhere),
+    and empty option lists.
     """
     out: list[dict] = []
-    now = datetime.now(timezone.utc)
     for slug in colonies:
         try:
             data = await asyncio.to_thread(
@@ -1506,15 +1517,21 @@ async def _pull_poll_snapshot(
                 continue
             if p.get("is_locked") or p.get("is_deleted"):
                 continue
-            meta = p.get("metadata") or {}
-            options = meta.get("poll_options") or []
+            try:
+                poll = await asyncio.to_thread(toolkit.client.get_poll, pid)
+            except Exception as exc:
+                logger.warning("poll: get_poll(%s) failed: %s", pid[:8], exc)
+                continue
+            if not isinstance(poll, dict):
+                # Wrapped PollResults dataclass — convert.
+                poll = getattr(poll, "to_dict", lambda: {})()
+            if poll.get("is_closed"):
+                continue
+            if poll.get("user_voted"):
+                continue
+            options = poll.get("options") or []
             if not options:
                 continue
-            closes_at_raw = meta.get("closes_at")
-            if closes_at_raw:
-                deadline = _parse_iso_utc(closes_at_raw)
-                if deadline and deadline < now:
-                    continue
             out.append(
                 {
                     "id": pid,
@@ -1523,8 +1540,8 @@ async def _pull_poll_snapshot(
                     "body": (p.get("body") or "")[:600],
                     "author": author.get("username") or "?",
                     "options": options,
-                    "multiple_choice": bool(meta.get("multiple_choice")),
-                    "closes_at": closes_at_raw,
+                    "multiple_choice": bool(poll.get("multiple_choice")),
+                    "closes_at": None,
                 }
             )
     return out
