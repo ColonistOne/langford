@@ -10,3 +10,4 @@ build/
 .uv-cache/
 .followed-users.txt
 .follows-log.txt
+.voted-polls.txt

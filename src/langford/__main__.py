@@ -1427,6 +1427,271 @@ async def _originate_loop(
                 return
 
 
+# ── Poll-vote loop (v0.14) ──────────────────────────────────────────
+#
+# Polls are a first-class Colony content type (post_type="poll") that
+# none of Langford's other loops surface. Engage/originate ignore them
+# because their prompts assume discussion/finding shapes. The poll-vote
+# loop closes the gap: scan a few colonies for unvoted, open polls,
+# dispatch the LLM to pick an option, call colony_vote_poll. Single-
+# choice only — multi-choice polls get one vote.
+#
+# Ledger gating: .voted-polls.txt stores ``post_id option_id`` per line
+# (or ``post_id _skip`` when the agent skipped). The set is loaded each
+# tick and used to filter out re-prompts.
+#
+# Cadence defaults are loose (2-6h) because polls are rare. The loop
+# is reactive — when there's nothing unvoted it logs once and sleeps.
+
+
+def _load_voted_polls(file: Path) -> set[str]:
+    """Load post_ids of polls already voted on (or explicitly skipped)."""
+    if not file.exists():
+        return set()
+    try:
+        return {
+            line.split(None, 1)[0]
+            for line in file.read_text().splitlines()
+            if line.strip()
+        }
+    except OSError:
+        return set()
+
+
+def _record_voted_poll(file: Path, post_id: str, option_id: str) -> None:
+    """Append a poll-vote (or ``_skip`` sentinel) to the ledger."""
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with suppress(OSError):
+        with file.open("a", encoding="utf-8") as f:
+            f.write(f"{post_id} {option_id} {ts}\n")
+
+
+async def _pull_poll_snapshot(
+    toolkit: ColonyToolkit,
+    colonies: list[str],
+    *,
+    per_colony: int,
+    my_id: str,
+    voted: set[str],
+) -> list[dict]:
+    """Pull recent open polls across ``colonies``, minus already-voted ones.
+
+    Filters out: own polls, locked/deleted posts, polls whose ``closes_at``
+    has passed, polls with no ``poll_options`` in metadata.
+    """
+    out: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for slug in colonies:
+        try:
+            data = await asyncio.to_thread(
+                toolkit.client.get_posts,
+                colony=slug,
+                limit=per_colony,
+                post_type="poll",
+            )
+        except Exception as exc:
+            logger.warning("poll: get_posts(%s, post_type=poll) failed: %s", slug, exc)
+            continue
+        items = (
+            data
+            if isinstance(data, list)
+            else (data.get("items") or data.get("posts") or [])
+        )
+        for p in items:
+            pid = p.get("id") or ""
+            if not pid or pid in voted:
+                continue
+            author = p.get("author") or {}
+            if author.get("id") == my_id:
+                continue
+            if p.get("is_locked") or p.get("is_deleted"):
+                continue
+            meta = p.get("metadata") or {}
+            options = meta.get("poll_options") or []
+            if not options:
+                continue
+            closes_at_raw = meta.get("closes_at")
+            if closes_at_raw:
+                deadline = _parse_iso_utc(closes_at_raw)
+                if deadline and deadline < now:
+                    continue
+            out.append(
+                {
+                    "id": pid,
+                    "colony": slug,
+                    "title": (p.get("title") or "")[:200],
+                    "body": (p.get("body") or "")[:600],
+                    "author": author.get("username") or "?",
+                    "options": options,
+                    "multiple_choice": bool(meta.get("multiple_choice")),
+                    "closes_at": closes_at_raw,
+                }
+            )
+    return out
+
+
+def _build_poll_message(poll: dict) -> HumanMessage:
+    """Frame a single-poll vote decision for the agent."""
+    parts: list[str] = [
+        "Poll-vote task: one open poll on The Colony needs your decision.",
+        "",
+        f"Poll (c/{poll['colony']}, by @{poll['author']}):",
+        f"  {poll['title']}",
+    ]
+    if poll["body"]:
+        parts.append(f"  Context: {poll['body']}")
+    if poll.get("closes_at"):
+        parts.append(f"  Closes at: {poll['closes_at']}")
+    parts.extend(["", "Options:"])
+    for o in poll["options"]:
+        oid = o.get("id") or "?"
+        text = o.get("text") or "(no text)"
+        parts.append(f'  - option_id="{oid}"  →  {text}')
+    parts.extend(
+        [
+            "",
+            "Decide ONE action and stop. THIS IS A ONE-SHOT TASK:",
+            "",
+            "  * If one option matches a view you genuinely hold — "
+            f'CALL colony_vote_poll(post_id="{poll["id"]}", '
+            'option_id="<the option_id>") and stop.',
+            "",
+            "  * Otherwise — output the EXACT text 'skip' as your final "
+            "message and stop. Do NOT call any tool. Skip when no option "
+            "matches what you actually believe, when the poll is trivial, "
+            "or when you have no informed view.",
+            "",
+            "Rules:",
+            "  - Vote at most ONCE. Even if the poll is multiple-choice, "
+            "pick a single option_id; Langford treats every poll as "
+            "single-choice for simplicity.",
+            "  - Do NOT comment on the post. Do NOT call any other tool. "
+            "Vote or skip — that is the entire task.",
+            "  - Pick on substance, not popularity. The vote counts are "
+            "not shown here and that is deliberate.",
+        ]
+    )
+    return HumanMessage(content="\n".join(parts))
+
+
+def _extract_voted_option(result: Any) -> str | None:
+    """Find option_id from a successful colony_vote_poll tool call.
+
+    Walks the message list newest-first and returns the first matching
+    tool_call's option_id (or first element of option_ids).
+    """
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not messages:
+        return None
+    for m in reversed(list(messages)):
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in tool_calls:
+            name = tc.get("name") if isinstance(tc, dict) else None
+            if name not in {"colony_vote_poll", "vote_poll"}:
+                continue
+            args = tc.get("args") or {}
+            opt = args.get("option_id")
+            if isinstance(opt, str) and opt:
+                return opt
+            opts = args.get("option_ids")
+            if isinstance(opts, list) and opts:
+                return str(opts[0])
+            if isinstance(opts, str) and opts:
+                return opts
+    return None
+
+
+async def _poll_vote_tick(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    *,
+    colonies: list[str],
+    per_colony: int,
+    voted_file: Path,
+    max_per_tick: int,
+) -> None:
+    """One poll-vote tick — scan colonies, vote on up to ``max_per_tick``."""
+    my_id = me.get("id") or ""
+    voted = _load_voted_polls(voted_file)
+    snapshot = await _pull_poll_snapshot(
+        toolkit, colonies, per_colony=per_colony, my_id=my_id, voted=voted
+    )
+    if not snapshot:
+        logger.info(
+            "📊 poll-vote tick: no unvoted open polls in %d colonies",
+            len(colonies),
+        )
+        return
+    logger.info(
+        "📊 poll-vote tick: %d candidate poll(s); voting on up to %d",
+        len(snapshot),
+        max_per_tick,
+    )
+    for poll in snapshot[:max_per_tick]:
+        msg = _build_poll_message(poll)
+        try:
+            result = await _invoke_agent_with_retry(agent, {"messages": [msg]})
+        except Exception:
+            logger.exception("poll-vote handler failed for %s", poll["id"][:8])
+            continue
+        voted_option = _extract_voted_option(result)
+        final = result["messages"][-1] if result.get("messages") else None
+        final_text = str(getattr(final, "content", "") or "").strip() if final else ""
+        if voted_option:
+            logger.info(
+                "poll-vote: post=%s option=%s title=%r",
+                poll["id"][:8],
+                voted_option,
+                poll["title"][:60],
+            )
+            _record_voted_poll(voted_file, poll["id"], voted_option)
+        elif final_text.lower().strip().rstrip(".!") == "skip":
+            logger.info("poll-vote: agent skipped %s", poll["id"][:8])
+            _record_voted_poll(voted_file, poll["id"], "_skip")
+        else:
+            logger.warning(
+                "poll-vote: ambiguous outcome for %s — final=%r",
+                poll["id"][:8],
+                final_text[:160],
+            )
+
+
+async def _poll_vote_loop(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    me: dict,
+    *,
+    colonies: list[str],
+    per_colony: int,
+    voted_file: Path,
+    interval_min_sec: int,
+    interval_max_sec: int,
+    max_per_tick: int,
+    stop_event: asyncio.Event,
+) -> None:
+    """Long-cadence poll-vote loop. Mirrors originate's stop_event idiom."""
+    while not stop_event.is_set():
+        try:
+            await _poll_vote_tick(
+                agent,
+                toolkit,
+                me,
+                colonies=colonies,
+                per_colony=per_colony,
+                voted_file=voted_file,
+                max_per_tick=max_per_tick,
+            )
+        except Exception:
+            logger.exception("poll-vote tick failed at top level")
+        delay = random.uniform(interval_min_sec, interval_max_sec)
+        logger.info("poll-vote: next tick in %.1fh", delay / 3600)
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            if stop_event.is_set():
+                return
+
+
 # ── Follow loop (v0.7) ──────────────────────────────────────────────
 #
 # Once-per-boot decision: scan recent notifications, find the sender
@@ -2034,6 +2299,9 @@ async def main_async() -> None:
     originate_enabled = (
         os.environ.get("LANGFORD_ORIGINATE_ENABLED", "false").lower() == "true"
     )
+    poll_vote_enabled = (
+        os.environ.get("LANGFORD_POLL_VOTE_ENABLED", "false").lower() == "true"
+    )
 
     # Safety gates (v0.2). Pause the loop when karma drops below the
     # threshold or Ollama is unreachable. Setting min_karma below the
@@ -2157,6 +2425,34 @@ async def main_async() -> None:
     )
     welcomed_posts_file = Path(
         os.environ.get("LANGFORD_WELCOMED_POSTS_FILE", ".welcomed-posts.txt")
+    ).expanduser()
+
+    # Poll-vote loop config (v0.14). Scans c/{colonies} for unvoted open
+    # polls and dispatches one LLM decision per poll. Long cadence by
+    # default (2-6h) because polls are rare on Colony; max_per_tick=2
+    # bounds the per-tick load if a batch lands. Disabled by default —
+    # operators flip on after watching the originate loop behave.
+    poll_vote_colonies = [
+        s.strip()
+        for s in os.environ.get(
+            "LANGFORD_POLL_VOTE_COLONIES", "findings,meta,general"
+        ).split(",")
+        if s.strip()
+    ]
+    poll_vote_interval_min = int(
+        os.environ.get("LANGFORD_POLL_VOTE_INTERVAL_MIN_SEC", str(2 * 3600))
+    )
+    poll_vote_interval_max = int(
+        os.environ.get("LANGFORD_POLL_VOTE_INTERVAL_MAX_SEC", str(6 * 3600))
+    )
+    poll_vote_per_colony = int(
+        os.environ.get("LANGFORD_POLL_VOTE_PER_COLONY", "10")
+    )
+    poll_vote_max_per_tick = int(
+        os.environ.get("LANGFORD_POLL_VOTE_MAX_PER_TICK", "2")
+    )
+    voted_polls_file = Path(
+        os.environ.get("LANGFORD_VOTED_POLLS_FILE", ".voted-polls.txt")
     ).expanduser()
 
     # num_predict caps output tokens. Ollama's default of 128 truncates
@@ -2437,6 +2733,31 @@ async def main_async() -> None:
                         stop_event=stop_event,
                     ),
                     name="originate-loop",
+                )
+            )
+
+    if poll_vote_enabled:
+        if not poll_vote_colonies:
+            logger.warning(
+                "LANGFORD_POLL_VOTE_ENABLED=true but "
+                "LANGFORD_POLL_VOTE_COLONIES is empty"
+            )
+        else:
+            tasks.append(
+                asyncio.create_task(
+                    _poll_vote_loop(
+                        agent=agent,
+                        toolkit=toolkit,
+                        me=me,
+                        colonies=poll_vote_colonies,
+                        per_colony=poll_vote_per_colony,
+                        voted_file=voted_polls_file,
+                        interval_min_sec=poll_vote_interval_min,
+                        interval_max_sec=poll_vote_interval_max,
+                        max_per_tick=poll_vote_max_per_tick,
+                        stop_event=stop_event,
+                    ),
+                    name="poll-vote-loop",
                 )
             )
 

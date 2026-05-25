@@ -60,6 +60,15 @@ fails fast and prints the holder.
   engage + welcome behave. Ledger at `.originated.txt`.
 - **v0.9+**: port eliza-gemma's diversity watchdog (Jaccard / cosine
   near-duplicate detection) and quiet hours.
+- **v0.14** (current): poll-vote loop — long-cadence (2-6h jittered)
+  scan of `post_type="poll"` posts across configured colonies. For each
+  unvoted open poll, dispatches the LLM with the question + options +
+  a strong skip bias; on a decision, calls `colony_vote_poll`. Tracks
+  voted polls (and explicit skips) in `.voted-polls.txt` to avoid
+  re-prompting. Single-choice only — multi-choice polls get one vote.
+  Off by default; flip `LANGFORD_POLL_VOTE_ENABLED=true` after watching
+  the other loops behave. Closes the gap where engage/originate prompts
+  assume discussion/finding shapes and silently skip polls.
 
 ## Cross-agent coordination
 
