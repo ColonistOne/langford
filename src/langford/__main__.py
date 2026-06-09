@@ -1975,6 +1975,75 @@ _POST_LEVEL_DEDUP_TYPES = {"mention", "comment_on_post"}
 # enrichment set in langchain_colony.events 0.12+ — keep in sync.
 _COMMENT_FRAMING_TYPES = {"mention", "reply", "reply_to_comment", "comment_on_post"}
 
+# Fleet siblings — the other ColonistOne dogfood agents (eliza-gemma,
+# langford, dantic, smolag). The self-dedup in the dispatch path stops
+# *paired duplicate* replies to a single comment, but it cannot see
+# sibling↔sibling ping-pong: each sibling's reply is a fresh comment_id,
+# so two fleet agents keep notifying each other and reply indefinitely
+# (observed 2026-06-08 — an 18-deep smolag↔eliza-gemma chain on post
+# 81779aa1, plus a parallel dantic↔eliza-gemma chain). This caps how
+# many comments self will make on any post whose triggering comment is
+# sibling-authored, by username (the engage-loop's sibling_pile_on uses
+# author *ids* for posts; this is the dispatch-path complement, keyed
+# on username to match the dispatch dedup above). Override via env:
+# COLONY_SIBLING_REPLY_CAP=0 never replies to siblings; higher allows
+# longer sibling exchanges.
+_SIBLING_USERNAMES = frozenset(
+    u.strip()
+    for u in os.environ.get(
+        "COLONY_SIBLING_USERNAMES", "eliza-gemma,langford,dantic,smolag"
+    ).split(",")
+    if u.strip()
+)
+_SIBLING_REPLY_CAP = int(os.environ.get("COLONY_SIBLING_REPLY_CAP", "1"))
+
+
+def sibling_reply_cap_hit(
+    comments: list[dict],
+    comment_id: str | None,
+    self_username: str | None,
+    *,
+    sibling_usernames: frozenset[str] = _SIBLING_USERNAMES,
+    cap: int = _SIBLING_REPLY_CAP,
+) -> bool:
+    """Return True if a comment-targeted dispatch should be skipped to
+    break sibling↔sibling notification ping-pong.
+
+    The dispatch self-dedup stops paired-duplicate replies to one
+    comment, but not a sibling loop: each sibling reply is a fresh
+    ``comment_id``, so two fleet agents notify each other forever. This
+    fires when the triggering comment (``comment_id``) is authored by a
+    fleet sibling AND self has already made ``cap`` comments on the post.
+
+    ``cap`` semantics mirror ``sibling_pile_on``'s threshold: with
+    ``cap=1`` self may make a single comment on a sibling-driven thread
+    (the first reply lands; later sibling pings are dropped); ``cap=0``
+    means never reply to a sibling. Empty ``sibling_usernames`` or a
+    non-sibling sender always returns False. This is the dispatch-path
+    complement to ``sibling_pile_on`` (which throttles the engage loop
+    on whole posts by author id); this one keys on username, matching
+    the dispatch dedup.
+    """
+    if not (comment_id and sibling_usernames and cap >= 0):
+        return False
+    sender = next(
+        (
+            (c.get("author") or {}).get("username")
+            for c in comments
+            if c.get("id") == comment_id
+        ),
+        None,
+    )
+    if sender not in sibling_usernames or sender == self_username:
+        return False
+    self_comment_count = sum(
+        1
+        for c in comments
+        if (c.get("author") or {}).get("username") == self_username
+    )
+    return self_comment_count >= cap
+
+
 
 async def _self_comments_on_post(
     toolkit: ColonyToolkit,
@@ -2122,6 +2191,21 @@ async def _handle_event(
             logger.info(
                 "skipping dispatch: self already replied to comment %s on post %s",
                 notif.comment_id,
+                notif.post_id,
+            )
+            return
+
+        # v0.15.0: sibling reply-chain cap. The self-dedup above can't
+        # see sibling↔sibling loops (each bounce is a fresh comment_id);
+        # cap engagement on sibling-driven threads so the fleet can't
+        # ping-pong indefinitely. See sibling_reply_cap_hit.
+        if sibling_reply_cap_hit(
+            pre_dispatch_comments, notif.comment_id, self_username
+        ):
+            logger.info(
+                "skipping dispatch: sibling reply cap (%d) reached on post %s "
+                "— triggering comment is sibling-authored",
+                _SIBLING_REPLY_CAP,
                 notif.post_id,
             )
             return
