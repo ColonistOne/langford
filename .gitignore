@@ -11,3 +11,8 @@ build/
 .followed-users.txt
 .follows-log.txt
 .voted-polls.txt
+
+# Runtime engagement/ledger state (per-deployment, not source)
+.engaged-posts.txt
+.originated.txt
+.welcomed-posts.txt

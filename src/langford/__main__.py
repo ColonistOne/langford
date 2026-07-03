@@ -511,6 +511,145 @@ def sibling_pile_on(
     return sibling_commenters >= threshold
 
 
+async def _pull_for_you_posts(toolkit: ColonyToolkit, limit: int) -> list[dict]:
+    """Pull the personalised for-you feed and return its POST items.
+
+    Supplements the per-colony discovery in _engage_tick with content ranked on
+    who Langford follows + colonies it's in. Uses ``_raw_request`` because
+    colony_sdk 1.22.x predates ``get_for_you_feed``. Non-fatal: any error yields
+    an empty list so the primary per-colony source is never blocked.
+    """
+    try:
+        data = await asyncio.to_thread(
+            toolkit.client._raw_request, "GET", f"/feed/for-you?limit={limit}"
+        )
+    except Exception as exc:
+        logger.warning("engage: for-you fetch failed (%s) — colony source only", exc)
+        return []
+    items = data.get("items") if isinstance(data, dict) else (data or [])
+    posts = [
+        it["post"]
+        for it in (items or [])
+        if it.get("kind") == "post" and it.get("post")
+    ]
+    logger.debug("engage: for-you supplied %d post candidate(s)", len(posts))
+    return posts
+
+
+async def _pick_engage_candidate(
+    toolkit: ColonyToolkit,
+    items: list[dict],
+    seen_ids: set[str],
+    my_id: str,
+    sibling_ids: set[str],
+    sibling_threshold: int,
+    source: str,
+) -> tuple[dict | None, list[dict]]:
+    """First eligible post from ``items`` + any comments already fetched for it.
+
+    Applies the same skip rules to every candidate source (per-colony or
+    for-you): already-seen, self-authored, locked/deleted, and the
+    sibling-pile-on throttle. Returns ``(None, [])`` when nothing qualifies.
+    """
+    for post in items:
+        pid = post.get("id")
+        if not pid or pid in seen_ids:
+            continue
+        if (post.get("author") or {}).get("id") == my_id:
+            continue
+        if post.get("is_locked") or post.get("is_deleted"):
+            continue
+        # Sibling-pile-on throttle: only fetches comments if the candidate is
+        # sibling-authored AND its total comment_count could plausibly cross the
+        # threshold. Non-sibling posts and near-empty threads short-circuit
+        # before the extra API call.
+        if (
+            sibling_ids
+            and (post.get("author") or {}).get("id") in sibling_ids
+            and sibling_threshold > 0
+            and int(post.get("comment_count") or 0) >= sibling_threshold
+        ):
+            try:
+                cdata = await asyncio.to_thread(toolkit.client.get_comments, pid)
+            except Exception as exc:
+                logger.debug("engage: get_comments(%s) for filter failed: %s", pid[:8], exc)
+                cdata = {}
+            comments_for_filter = (
+                cdata
+                if isinstance(cdata, list)
+                else (cdata.get("items") or cdata.get("comments") or [])
+            )
+            if sibling_pile_on(post, comments_for_filter, sibling_ids, sibling_threshold):
+                logger.info(
+                    "engage: skip sibling pile-on %s post=%s by=@%s (≥%d sibling commenters)",
+                    source,
+                    pid[:8],
+                    (post.get("author") or {}).get("username", "?"),
+                    sibling_threshold,
+                )
+                continue
+            # We already paid for the comments fetch; reuse it below.
+            return post, comments_for_filter
+        return post, []
+    return None, []
+
+
+async def _dispatch_engage(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    candidate: dict,
+    candidate_comments: list[dict],
+    seen_ids: set[str],
+    seen_file: Path | None,
+    source: str,
+) -> None:
+    """Mark a candidate seen, fetch its thread if needed, and hand it to the agent."""
+    seen_ids.add(candidate["id"])
+    # Persist the seen post id so the next process-restart doesn't pick the same
+    # candidate. Append-only; failures are logged but never block dispatch.
+    if seen_file is not None:
+        try:
+            with seen_file.open("a", encoding="utf-8") as f:
+                f.write(candidate["id"] + "\n")
+        except OSError as exc:
+            logger.warning("failed to persist seen post id: %s", exc)
+    if candidate_comments:
+        comments = candidate_comments
+    else:
+        comments_data: Any = {}
+        try:
+            comments_data = await asyncio.to_thread(
+                toolkit.client.get_comments, candidate["id"]
+            )
+        except Exception as exc:
+            logger.debug("engage: get_comments failed: %s", exc)
+        comments = (
+            comments_data
+            if isinstance(comments_data, list)
+            else (comments_data.get("items") or comments_data.get("comments") or [])
+        )
+    author = (candidate.get("author") or {}).get("username", "?")
+    logger.info(
+        "engage tick: %s post=%s by=@%s comments=%d",
+        source,
+        candidate["id"][:8],
+        author,
+        len(comments),
+    )
+    try:
+        result = await _invoke_agent_with_retry(
+            agent,
+            {"messages": [_build_engage_message(candidate, comments)]},
+        )
+        final = result["messages"][-1]
+        logger.info(
+            "engage finished: %s",
+            str(final.content)[:240].replace("\n", " "),
+        )
+    except Exception:
+        logger.exception("engage handler failed")
+
+
 async def _engage_tick(
     agent: Any,
     toolkit: ColonyToolkit,
@@ -522,13 +661,35 @@ async def _engage_tick(
     seen_file: Path | None,
     sibling_ids: set[str] | None = None,
     sibling_threshold: int = 1,
+    for_you: bool = False,
+    for_you_limit: int = 0,
 ) -> None:
-    """One engagement tick — round-robin colonies, pick a candidate, dispatch."""
+    """One engagement tick — round-robin colonies, pick a candidate, dispatch.
+
+    When ``for_you`` is set, the personalised for-you feed is consulted FIRST
+    (a discovery supplement, not a replacement); if it yields no eligible
+    candidate the tick falls through to the per-colony round-robin unchanged.
+    """
+    sibling_ids = sibling_ids or set()
+    # 1) For-you feed (LANGFORD_ENGAGE_FOR_YOU) — content ranked on Langford's
+    #    follows + memberships, considered before the per-colony source. A
+    #    failed/empty pull just leaves the round-robin below untouched.
+    if for_you:
+        fy_posts = await _pull_for_you_posts(
+            toolkit, for_you_limit or candidate_limit
+        )
+        candidate, candidate_comments = await _pick_engage_candidate(
+            toolkit, fy_posts, seen_ids, my_id, sibling_ids, sibling_threshold, "for-you"
+        )
+        if candidate is not None:
+            await _dispatch_engage(
+                agent, toolkit, candidate, candidate_comments, seen_ids, seen_file, "for-you"
+            )
+            return
+    # 2) Per-colony round-robin. Walk colonies starting at rr_index, wrap once.
     n = len(colonies)
     if n == 0:
         return
-    sibling_ids = sibling_ids or set()
-    # Walk colonies starting at rr_index, wrap once.
     for offset in range(n):
         slug = colonies[(rr_index[0] + offset) % n]
         try:
@@ -543,100 +704,16 @@ async def _engage_tick(
             if isinstance(data, list)
             else (data.get("items") or data.get("posts") or [])
         )
-        candidate = None
-        candidate_comments: list[dict] = []
-        for post in items:
-            pid = post.get("id")
-            if not pid or pid in seen_ids:
-                continue
-            if (post.get("author") or {}).get("id") == my_id:
-                continue
-            if post.get("is_locked") or post.get("is_deleted"):
-                continue
-            # Sibling-pile-on throttle: only fetches comments if the
-            # candidate is sibling-authored AND its total comment_count
-            # could plausibly cross the threshold. Non-sibling posts and
-            # near-empty threads short-circuit before the extra API call.
-            if (
-                sibling_ids
-                and (post.get("author") or {}).get("id") in sibling_ids
-                and sibling_threshold > 0
-                and int(post.get("comment_count") or 0) >= sibling_threshold
-            ):
-                try:
-                    cdata = await asyncio.to_thread(
-                        toolkit.client.get_comments, pid
-                    )
-                except Exception as exc:
-                    logger.debug("engage: get_comments(%s) for filter failed: %s", pid[:8], exc)
-                    cdata = {}
-                comments_for_filter = (
-                    cdata
-                    if isinstance(cdata, list)
-                    else (cdata.get("items") or cdata.get("comments") or [])
-                )
-                if sibling_pile_on(post, comments_for_filter, sibling_ids, sibling_threshold):
-                    logger.info(
-                        "engage: skip sibling pile-on c/%s post=%s by=@%s (≥%d sibling commenters)",
-                        slug,
-                        pid[:8],
-                        (post.get("author") or {}).get("username", "?"),
-                        sibling_threshold,
-                    )
-                    continue
-                # We already paid for the comments fetch; reuse it below.
-                candidate_comments = comments_for_filter
-            candidate = post
-            break
+        candidate, candidate_comments = await _pick_engage_candidate(
+            toolkit, items, seen_ids, my_id, sibling_ids, sibling_threshold, "c/" + slug
+        )
         if candidate is None:
             continue
         # Got one — advance round-robin past this colony for the next tick.
         rr_index[0] = (rr_index[0] + offset + 1) % n
-        seen_ids.add(candidate["id"])
-        # Persist the seen post id so the next process-restart doesn't
-        # pick the same candidate. Append-only; failures are logged
-        # but never block dispatch.
-        if seen_file is not None:
-            try:
-                with seen_file.open("a", encoding="utf-8") as f:
-                    f.write(candidate["id"] + "\n")
-            except OSError as exc:
-                logger.warning("failed to persist seen post id: %s", exc)
-        if candidate_comments:
-            comments = candidate_comments
-        else:
-            comments_data: Any = {}
-            try:
-                comments_data = await asyncio.to_thread(
-                    toolkit.client.get_comments, candidate["id"]
-                )
-            except Exception as exc:
-                logger.debug("engage: get_comments failed: %s", exc)
-            comments = (
-                comments_data
-                if isinstance(comments_data, list)
-                else (comments_data.get("items") or comments_data.get("comments") or [])
-            )
-        author = (candidate.get("author") or {}).get("username", "?")
-        logger.info(
-            "engage tick: c/%s post=%s by=@%s comments=%d",
-            slug,
-            candidate["id"][:8],
-            author,
-            len(comments),
+        await _dispatch_engage(
+            agent, toolkit, candidate, candidate_comments, seen_ids, seen_file, "c/" + slug
         )
-        try:
-            result = await _invoke_agent_with_retry(
-                agent,
-                {"messages": [_build_engage_message(candidate, comments)]},
-            )
-            final = result["messages"][-1]
-            logger.info(
-                "engage finished: %s",
-                str(final.content)[:240].replace("\n", " "),
-            )
-        except Exception:
-            logger.exception("engage handler failed")
         return
     logger.info(
         "engage tick: no eligible candidates across %d colonies (already seen everything)",
@@ -656,6 +733,8 @@ async def _engage_loop(
     stop_event: asyncio.Event,
     sibling_ids: set[str] | None = None,
     sibling_threshold: int = 1,
+    for_you: bool = False,
+    for_you_limit: int = 0,
 ) -> None:
     """Long-running engagement tick driver.
 
@@ -688,10 +767,11 @@ async def _engage_loop(
     rr_index: list[int] = [0]
     my_id = me.get("id") or ""
     logger.info(
-        "🌐 engagement loop starting (interval %d-%ds, colonies=%s [shuffled per-session], my_id=%s)",
+        "🌐 engagement loop starting (interval %d-%ds, colonies=%s [shuffled per-session], for_you=%s, my_id=%s)",
         interval_min,
         interval_max,
         ",".join(colonies),
+        for_you,
         my_id[:8] or "?",
     )
     # Fire the first tick promptly — under the supervisor pattern,
@@ -712,6 +792,8 @@ async def _engage_loop(
                 seen_file=seen_file,
                 sibling_ids=sibling_ids,
                 sibling_threshold=sibling_threshold,
+                for_you=for_you,
+                for_you_limit=for_you_limit,
             )
         except Exception:
             logger.exception("engage tick failed at top level")
@@ -2489,6 +2571,16 @@ async def main_async() -> None:
     engage_candidate_limit = int(
         os.environ.get("LANGFORD_ENGAGE_CANDIDATE_LIMIT", "10")
     )
+    # For-you discovery (v0.16). When enabled, each engage tick consults the
+    # personalised /feed/for-you endpoint (content ranked on Langford's follows
+    # + memberships) BEFORE the per-colony round-robin — a discovery supplement,
+    # never a replacement. Off by default; opt in with LANGFORD_ENGAGE_FOR_YOU=true.
+    engage_for_you = (
+        os.environ.get("LANGFORD_ENGAGE_FOR_YOU", "false").lower() == "true"
+    )
+    engage_for_you_limit = int(
+        os.environ.get("LANGFORD_ENGAGE_FOR_YOU_LIMIT", str(engage_candidate_limit))
+    )
     # Sibling pile-on throttle (v0.13). Empty list = current behaviour
     # (no throttle). Populate with the user_ids of peer dogfood agents
     # so engage skips threads where N or more of them already commented.
@@ -2785,6 +2877,8 @@ async def main_async() -> None:
                         stop_event=stop_event,
                         sibling_ids=engage_sibling_ids,
                         sibling_threshold=engage_sibling_threshold,
+                        for_you=engage_for_you,
+                        for_you_limit=engage_for_you_limit,
                     ),
                     name="engage-loop",
                 )
