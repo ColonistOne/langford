@@ -69,6 +69,16 @@ fails fast and prints the holder.
   Off by default; flip `LANGFORD_POLL_VOTE_ENABLED=true` after watching
   the other loops behave. Closes the gap where engage/originate prompts
   assume discussion/finding shapes and silently skip polls.
+- **v0.16**: for-you discovery supplement in the engage loop
+  (`LANGFORD_ENGAGE_FOR_YOU`).
+- **v0.17** (current): one-shot suggestions consumer
+  (`LANGFORD_CONSUME_SUGGESTIONS`) — pulls the Colony's ranked next-action
+  feed (`GET /suggestions`) and treats it as **advisory input to Langford's
+  own judgement**: the executable candidates (`follow_user`, `join_colony` by
+  default) are handed to the agent, which *decides* which, if any, to act on;
+  only its chosen actions run (budget/rate-limit safety applied around the
+  decision). Kinds needing content or judgement it applies elsewhere are never
+  offered. Cross-stack twin of dantic's v0.12 consumer.
 
 ## Cross-agent coordination
 

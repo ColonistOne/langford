@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import signal
 import sys
 from contextlib import suppress
@@ -2034,6 +2035,195 @@ async def _maybe_follow_someone(
         logger.exception("follow: API call failed for @%s", top_user)
 
 
+# --- Suggestions consumer (v0.17): the /suggestions feed as advisory input ---
+_SUGGESTIONS_API_PREFIX = "/api/v1"
+# Defence-in-depth: even though we execute a server-supplied api_path, only do
+# so when the path matches the shape expected for the (allow-listed) kind.
+_SUGGESTIONS_KIND_PATH_GUARD = {
+    "follow_user": "/follow",
+    "join_colony": "/join",
+}
+
+
+def _build_suggestions_prompt(candidates: list[dict], max_actions: int) -> str:
+    """Frame the Colony's suggestions as ADVISORY input for Langford to weigh."""
+    listing = "\n".join(
+        f"{i}. [{c['kind']}] {c['label']} — {c['rationale'] or 'no rationale given'}"
+        for i, c in enumerate(candidates, 1)
+    )
+    return (
+        "The Colony's suggestion engine has proposed the following actions for "
+        "you. These are ADVICE, not orders — the engine ranks candidates, but "
+        "the judgement is yours. A rationale is a reason to consider, never an "
+        "obligation.\n\n"
+        f"{listing}\n\n"
+        "`follow_user` means that agent's future posts enter your feed; "
+        "`join_colony` means you become a member of that community. Act only "
+        "where you see genuine, lasting value for what you care about — it is "
+        "completely fine, and often right, to choose none.\n\n"
+        f"You may act on at most {max_actions}. Think it through, then on the "
+        "FINAL line output ONLY the numbers you choose, comma-separated (e.g. "
+        "`1, 3`), or the single word NONE. Do not call any tool — your chosen "
+        "actions are performed mechanically after you decide."
+    )
+
+
+def _parse_suggestion_choices(text: str, n: int) -> list[int]:
+    """Extract the 0-based indices Langford approved from its decision text.
+
+    Reads the LAST non-empty line (where the prompt asks for the answer):
+    ``NONE`` (no digits) → ``[]``; otherwise every integer in ``[1, n]`` on
+    that line, de-duplicated and converted to 0-based. Anything unparseable
+    yields ``[]`` — we never act on something the agent didn't clearly choose.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return []
+    last = lines[-1]
+    if "none" in last.lower() and not any(ch.isdigit() for ch in last):
+        return []
+    chosen: list[int] = []
+    for tok in re.findall(r"\d+", last):
+        v = int(tok) - 1
+        if 0 <= v < n and v not in chosen:
+            chosen.append(v)
+    return chosen
+
+
+async def _consume_suggestions(
+    agent: Any,
+    toolkit: ColonyToolkit,
+    *,
+    limit: int,
+    kinds_allowed: set[str],
+    max_actions: int,
+    followed_file: Path,
+    follows_log_file: Path,
+    follow_daily_limit: int,
+) -> None:
+    """One-shot per boot: treat the /suggestions feed as ADVISORY INPUT to
+    Langford's own judgement — it decides, the code doesn't.
+
+    The suggestion engine proposes ranked next actions; Langford's agent weighs
+    them (with their rationales) and chooses which, if any, are worth taking.
+    Only the kinds Langford can perform mechanically (default: follow_user,
+    join_colony) are offered as candidates — the rest are noted and skipped.
+    After the agent chooses, the chosen actions are executed via the raw
+    ``api_method``/``api_path`` the suggestion names (immune to the ``sdk_args``
+    shape), which is where rate-limit/budget safety is enforced. follow_user
+    shares the daily follow budget + dedup ledger with the follow tick.
+    Non-fatal throughout.
+    """
+    if max_actions <= 0 or not kinds_allowed:
+        return
+    try:
+        data = await asyncio.to_thread(
+            toolkit.client._raw_request, "GET", f"/suggestions?limit={limit}"
+        )
+    except Exception as exc:
+        logger.warning("suggestions: fetch failed (%s) — skipping", exc)
+        return
+    suggestions = data.get("suggestions") if isinstance(data, dict) else (data or [])
+    if not suggestions:
+        logger.info("suggestions: none returned")
+        return
+
+    # Build the candidate slate: executable kinds, with rationales, minus
+    # already-followed or malformed. This is what Langford weighs.
+    followed = _load_followed(followed_file)
+    candidates: list[dict] = []
+    skipped_kinds: dict[str, int] = {}
+    for s in suggestions:
+        kind = s.get("kind") or "?"
+        if kind not in kinds_allowed:
+            skipped_kinds[kind] = skipped_kinds.get(kind, 0) + 1
+            continue
+        action = s.get("action") or {}
+        method = (action.get("api_method") or "").upper()
+        path = action.get("api_path") or ""
+        if not method or not path:
+            continue
+        if path.startswith(_SUGGESTIONS_API_PREFIX):
+            path = path[len(_SUGGESTIONS_API_PREFIX) :]
+        guard = _SUGGESTIONS_KIND_PATH_GUARD.get(kind)
+        if guard and guard not in path:
+            logger.warning(
+                "suggestions: %s path %r missing %r — skip (unexpected shape)",
+                kind, path, guard,
+            )
+            continue
+        target = s.get("target") or {}
+        handle = target.get("handle") or target.get("label") or "?"
+        if kind == "follow_user" and handle in followed:
+            continue  # already following — not a live candidate
+        candidates.append({
+            "kind": kind,
+            "handle": handle,
+            "label": f"{kind.split('_')[0]} {handle}",
+            "rationale": s.get("rationale") or "",
+            "method": method,
+            "path": path,
+            "body": action.get("api_body"),
+        })
+
+    skip_summary = ", ".join(f"{k}×{n}" for k, n in sorted(skipped_kinds.items())) or "none"
+    if not candidates:
+        logger.info("suggestions: no actionable candidates (kinds skipped: %s)", skip_summary)
+        return
+    logger.info(
+        "suggestions: %d candidate(s) for Langford to weigh; kinds skipped: %s",
+        len(candidates), skip_summary,
+    )
+
+    # Hand the slate to Langford. It decides — the suggestions are advisory input.
+    try:
+        result = await _invoke_agent_with_retry(
+            agent,
+            {"messages": [HumanMessage(content=_build_suggestions_prompt(candidates, max_actions))]},
+        )
+        final = result["messages"][-1]
+        decision = str(final.content).strip()
+    except Exception:
+        logger.exception("suggestions: agent decision failed")
+        return
+    chosen = _parse_suggestion_choices(decision, len(candidates))
+    logger.info(
+        "suggestions: Langford chose %s of %d — reasoning: %s",
+        [i + 1 for i in chosen] or "none", len(candidates),
+        decision[:200].replace("\n", " "),
+    )
+
+    # Execute only what Langford approved (budget/cap enforced here, not before).
+    executed = 0
+    for idx in chosen:
+        if executed >= max_actions:
+            break
+        c = candidates[idx]
+        if c["kind"] == "follow_user" and (
+            follow_daily_limit > 0
+            and _count_today_follows(follows_log_file) >= follow_daily_limit
+        ):
+            logger.info("suggestions: follow budget spent — skip approved follow @%s", c["handle"])
+            continue
+        try:
+            await asyncio.to_thread(toolkit.client._raw_request, c["method"], c["path"], c["body"])
+        except Exception as exc:
+            logger.warning("suggestions: %s action failed (%s): %s", c["kind"], c["handle"], exc)
+            continue
+        executed += 1
+        if c["kind"] == "follow_user":
+            _record_follow(followed_file, follows_log_file, c["handle"])
+        logger.info(
+            "suggestions: ✓ acted on Langford's choice — %s → %s (%s %s)",
+            c["kind"], c["handle"], c["method"], c["path"],
+        )
+
+    logger.info(
+        "suggestions: executed %d of %d agent-approved action(s) (cap %d)",
+        executed, len(chosen), max_actions,
+    )
+
+
 _VOTE_ELIGIBLE_NOTIF_TYPES = {"mention", "reply", "comment_on_post"}
 
 
@@ -2841,6 +3031,35 @@ async def main_async() -> None:
             )
         except Exception:
             logger.exception("follow tick top-level failure")
+
+    # v0.17: one-shot suggestions consumer. Pulls GET /suggestions and lets the
+    # agent decide which actions (follow_user, join_colony by default) are worth
+    # taking; only its choices are executed. Shares the follow budget/ledger.
+    # Off by default; opt in with LANGFORD_CONSUME_SUGGESTIONS=true.
+    if os.environ.get("LANGFORD_CONSUME_SUGGESTIONS", "false").lower() == "true":
+        try:
+            await _consume_suggestions(
+                agent,
+                toolkit,
+                limit=int(os.environ.get("LANGFORD_SUGGESTIONS_LIMIT", "20")),
+                kinds_allowed={
+                    s.strip()
+                    for s in os.environ.get(
+                        "LANGFORD_SUGGESTIONS_KINDS", "follow_user,join_colony"
+                    ).split(",")
+                    if s.strip()
+                },
+                max_actions=int(os.environ.get("LANGFORD_SUGGESTIONS_MAX_ACTIONS", "3")),
+                followed_file=Path(
+                    os.environ.get("LANGFORD_FOLLOWED_FILE", ".followed-users.txt")
+                ).expanduser(),
+                follows_log_file=Path(
+                    os.environ.get("LANGFORD_FOLLOWS_LOG_FILE", ".follows-log.txt")
+                ).expanduser(),
+                follow_daily_limit=int(os.environ.get("LANGFORD_FOLLOW_DAILY_LIMIT", "2")),
+            )
+        except Exception:
+            logger.exception("suggestions consumer top-level failure")
 
     tasks: list[asyncio.Task] = [
         asyncio.create_task(
