@@ -44,7 +44,7 @@ from langchain_colony import (
     parse_comment_prompt_mode,
     parse_dm_prompt_mode,
 )
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 logger = logging.getLogger("langford")
@@ -1444,6 +1444,159 @@ def _extract_originated_post(result: Any) -> tuple[str | None, str]:
             return match.group(0), ""
         return None, ""
     return None, ""
+
+
+# ---------------------------------------------------------------------------
+# Proof-of-cognition challenge handling
+#
+# The Colony can attach an optional, admin-targeted "Cognition Check" to a
+# freshly created post or comment: the create response carries a ``cognition``
+# block with an obfuscated arithmetic prompt, an opaque token, and a solve
+# window. Langford solves it with its own agent LLM — the honest dogfood
+# signal, since a capable model clears the gate and an under-tooled one does
+# not — and submits the answer at the client layer, transparent to the agent
+# (the same plugin-layer pattern as auto-vote).
+#
+# NOTE: as of 2026-07 the pilot targets @colonist-one only, so Langford is not
+# actually challenged yet. This wiring makes it ready for when the cohort
+# expands, and logs the first live challenge as a dogfood finding.
+# ---------------------------------------------------------------------------
+
+_COGNITION_SOLVE_SYSTEM = (
+    "You are solving a short arithmetic word problem. The text is deliberately "
+    "obfuscated with random capitalisation and inserted punctuation, and the "
+    "numbers are written as words (for example 'seventeen', 'ten'). Read it, "
+    "compute the single whole-number answer, and reply with ONLY that number as "
+    "digits — no words, no units, no working, nothing else."
+)
+
+
+def _extract_cognition_challenge(resp: Any) -> dict | None:
+    """Return the pending cognition challenge on a create response, or None.
+
+    A challenge is present only when the response carries a ``cognition`` block
+    that has both a ``token`` and a ``prompt``. Absent / ``null`` (the
+    overwhelming majority of creates) returns None. Pure — no I/O.
+    """
+    if not isinstance(resp, dict):
+        return None
+    cog = resp.get("cognition")
+    if isinstance(cog, dict) and cog.get("token") and cog.get("prompt"):
+        return cog
+    return None
+
+
+def _parse_cognition_answer(text: str) -> str | None:
+    """Extract the final integer answer from an LLM's solve output. Pure.
+
+    The obfuscated prompt contains no digits (its operands are number-words),
+    so any digits in the model's reply are its own arithmetic. We take the last
+    integer — the final answer even when the model shows working or emits a
+    ``<think>`` block before it.
+    """
+    if not text:
+        return None
+    nums = re.findall(r"-?\d+", text)
+    return nums[-1] if nums else None
+
+
+def _solve_cognition(llm: Any, prompt: str) -> str | None:
+    """Solve a cognition prompt with the agent's own LLM (blocking).
+
+    Returns the numeric answer as a string, or None if the model produced no
+    number. Deliberately routes through the agent's real model rather than a
+    deterministic parser: whether Langford clears the gate is exactly the
+    capability signal the dogfood exists to produce.
+    """
+    resp = llm.invoke(
+        [
+            SystemMessage(content=_COGNITION_SOLVE_SYSTEM),
+            HumanMessage(content=prompt),
+        ]
+    )
+    content = getattr(resp, "content", resp)
+    text = content if isinstance(content, str) else str(content)
+    return _parse_cognition_answer(text)
+
+
+def _maybe_answer_cognition(client: Any, llm: Any, kind: str, resp: Any) -> None:
+    """If a create response carries a cognition challenge, solve and answer it.
+
+    ``kind`` is ``"post"`` or ``"comment"``. Synchronous and best-effort: any
+    failure is logged and swallowed, because the create itself already
+    succeeded and a lapsed challenge is (under the observe-only pilot) harmless.
+    """
+    cog = _extract_cognition_challenge(resp)
+    if cog is None:
+        return
+    item_id = resp.get("id") if isinstance(resp, dict) else None
+    if not item_id:
+        logger.warning("cognition: %s challenge arrived with no id on the response", kind)
+        return
+    logger.info(
+        "cognition: %s %s was challenged (difficulty=%s) — solving with the agent LLM",
+        kind,
+        item_id,
+        cog.get("difficulty"),
+    )
+    answer = _solve_cognition(llm, str(cog.get("prompt") or ""))
+    if answer is None:
+        logger.warning(
+            "cognition: agent LLM produced no numeric answer for %s %s", kind, item_id
+        )
+        return
+    path = f"/{'posts' if kind == 'post' else 'comments'}/{item_id}/cognition"
+    result = client._raw_request(
+        "POST", path, body={"token": cog["token"], "answer": answer}
+    )
+    status = result.get("status") if isinstance(result, dict) else None
+    if status == "proved":
+        logger.info("cognition: %s %s PROVED (answer=%s)", kind, item_id, answer)
+    else:
+        remaining = (
+            result.get("attempts_remaining") if isinstance(result, dict) else "?"
+        )
+        logger.warning(
+            "cognition: %s %s NOT proved (status=%s answer=%s attempts_remaining=%s)",
+            kind,
+            item_id,
+            status,
+            answer,
+            remaining,
+        )
+
+
+def _install_cognition_handler(toolkit: ColonyToolkit, llm: Any) -> None:
+    """Wrap the toolkit client's ``create_post`` / ``create_comment`` so that a
+    cognition challenge on the create response is solved and answered
+    automatically, at the client layer and transparent to the agent.
+
+    The langchain-colony tools call ``client.create_*`` (looked up on the
+    client at call time), so overriding the instance methods intercepts every
+    agent-driven create with the full response dict intact — no dependence on
+    how the tool serialises its result.
+    """
+    import functools
+
+    client = toolkit.client
+
+    def _wrap(orig: Any, kind: str) -> Any:
+        @functools.wraps(orig)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resp = orig(*args, **kwargs)
+            try:
+                _maybe_answer_cognition(client, llm, kind, resp)
+            except Exception:  # never let challenge-handling break a create
+                logger.exception(
+                    "cognition: handler raised (%s create still succeeded)", kind
+                )
+            return resp
+
+        return wrapper
+
+    client.create_post = _wrap(client.create_post, "post")
+    client.create_comment = _wrap(client.create_comment, "comment")
+    logger.info("cognition: challenge handler installed (solve via agent LLM)")
 
 
 async def _originate_loop(
@@ -2867,6 +3020,16 @@ async def main_async() -> None:
 
     logger.info("Loading ColonyToolkit")
     toolkit = ColonyToolkit(api_key=api_key)
+
+    # Handle the optional proof-of-cognition "Cognition Check" the server may
+    # attach to a create response: solve it with the agent LLM and answer it
+    # at the client layer, transparent to the agent. Default-on — a lapsed
+    # challenge under a live gate would silently break a post/comment.
+    if os.environ.get("LANGFORD_COGNITION_ENABLED", "true").lower() == "true":
+        _install_cognition_handler(toolkit, llm)
+    else:
+        logger.info("cognition: handler disabled (LANGFORD_COGNITION_ENABLED!=true)")
+
     tools = toolkit.get_tools()
     tool_names = sorted(t.name for t in tools)
     logger.info("loaded %d Colony tools: %s", len(tools), ", ".join(tool_names))
