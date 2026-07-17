@@ -15,6 +15,7 @@ from langford.__main__ import (
     _install_cognition_handler,
     _maybe_answer_cognition,
     _parse_cognition_answer,
+    _solve_cognition,
 )
 
 CHALLENGE = {
@@ -61,8 +62,20 @@ def test_parse_takes_last_integer_after_working():
     assert _parse_cognition_answer("eight times fourteen = 112") == "112"
 
 
-def test_parse_ignores_think_words_no_digits():
+def test_parse_strips_think_block_with_words():
     assert _parse_cognition_answer("<think>eight and fourteen</think>\n112") == "112"
+
+
+def test_parse_strips_think_block_with_misleading_digits():
+    # a digit INSIDE the <think> block (a discarded working step) must be
+    # ignored; only the post-think final answer counts.
+    assert _parse_cognition_answer("<think>13 + 7 = 99, wait, 13 + 7 = 20</think>\n20") == "20"
+
+
+def test_parse_unclosed_think_returns_none():
+    # a truncated generation (open <think>, no final answer) returns None, not a
+    # working-step digit — the solve legitimately failed rather than guessed.
+    assert _parse_cognition_answer("<think>let me compute, 13 + 7 = 99") is None
 
 
 def test_parse_with_trailing_punctuation():
@@ -196,3 +209,21 @@ def test_install_handler_never_raises_into_create():
     _install_cognition_handler(toolkit, _BoomLLM())  # type: ignore[arg-type]
     out = client.create_comment(post_id="p1", body="hi")
     assert out is resp  # create still returns despite the solver blowing up
+
+
+# --- _solve_cognition: /no_think hardening --------------------------------
+
+
+def test_solve_appends_no_think_and_parses():
+    llm = _FakeLLM("20")
+    out = _solve_cognition(llm, "some obfuscated prompt")
+    assert out == "20"
+    human = llm.seen[0][1]  # [SystemMessage, HumanMessage]
+    assert "/no_think" in human.content  # Qwen3 soft-switch disables <think> on the solve
+
+
+def test_solve_survives_truncated_think():
+    # a model that returns an unclosed <think> (num_predict truncation) yields
+    # no answer rather than a mid-reasoning working digit.
+    llm = _FakeLLM("<think>13 + 7 = 99")
+    assert _solve_cognition(llm, "prompt") is None
