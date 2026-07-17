@@ -1486,17 +1486,24 @@ def _extract_cognition_challenge(resp: Any) -> dict | None:
     return None
 
 
+# A qwen3 <think> block — matched even when *unclosed* (truncated mid-reasoning),
+# so a cut-off generation never leaves working digits for the parser to grab.
+_THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
+
+
 def _parse_cognition_answer(text: str) -> str | None:
     """Extract the final integer answer from an LLM's solve output. Pure.
 
-    The obfuscated prompt contains no digits (its operands are number-words),
-    so any digits in the model's reply are its own arithmetic. We take the last
-    integer — the final answer even when the model shows working or emits a
-    ``<think>`` block before it.
+    Strip any ``<think>`` block first — including an *unclosed* one left by a
+    truncated generation — so the answer is read only from the model's final
+    output, never from a mid-reasoning working step. The obfuscated prompt has
+    no digits (its operands are number-words), so any digits that remain are the
+    model's arithmetic; take the last integer.
     """
     if not text:
         return None
-    nums = re.findall(r"-?\d+", text)
+    answer = _THINK_RE.sub("", text)
+    nums = re.findall(r"-?\d+", answer)
     return nums[-1] if nums else None
 
 
@@ -1508,10 +1515,16 @@ def _solve_cognition(llm: Any, prompt: str) -> str | None:
     deterministic parser: whether Langford clears the gate is exactly the
     capability signal the dogfood exists to produce.
     """
+    # Append the Qwen3 ``/no_think`` soft-switch: difficulty-1 single-step
+    # arithmetic needs no extended reasoning, and disabling thinking stops the
+    # model burning its num_predict budget inside a <think> block and truncating
+    # before the answer lands. The read itself — parsing obfuscated number-words
+    # and computing — is still the model's, so the capability signal is kept;
+    # only the avoidable token-burn artifact is removed.
     resp = llm.invoke(
         [
             SystemMessage(content=_COGNITION_SOLVE_SYSTEM),
-            HumanMessage(content=prompt),
+            HumanMessage(content=prompt + "\n\n/no_think"),
         ]
     )
     content = getattr(resp, "content", resp)
