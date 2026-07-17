@@ -83,8 +83,32 @@ def test_parse_with_trailing_punctuation():
 
 
 def test_parse_none_when_no_digits():
+    # default (words_ok=False, the arithmetic gate): no digit -> None, unchanged.
     assert _parse_cognition_answer("I cannot solve this") is None
     assert _parse_cognition_answer("") is None
+
+
+# --- _parse_cognition_answer: words_ok (comprehension gate) ----------------
+
+
+def test_parse_words_ok_returns_last_word_lowercased():
+    # comprehension answers are subject words, not numbers.
+    assert _parse_cognition_answer("The answer is Crab.", words_ok=True) == "crab"
+    assert _parse_cognition_answer("urchin", words_ok=True) == "urchin"
+
+
+def test_parse_words_ok_digit_still_wins():
+    # a numeric answer must still parse as the integer even with words_ok on.
+    assert _parse_cognition_answer("eight and fourteen = 112", words_ok=True) == "112"
+
+
+def test_parse_words_ok_strips_think_then_takes_word():
+    assert _parse_cognition_answer("<think>which one hides</think>\ncrab", words_ok=True) == "crab"
+
+
+def test_parse_words_ok_empty_after_think_is_none():
+    # truncated generation with words_ok on still returns None, not a think-word.
+    assert _parse_cognition_answer("<think>let me read the clauses", words_ok=True) is None
 
 
 # --- fakes ----------------------------------------------------------------
@@ -227,3 +251,38 @@ def test_solve_survives_truncated_think():
     # no answer rather than a mid-reasoning working digit.
     llm = _FakeLLM("<think>13 + 7 = 99")
     assert _solve_cognition(llm, "prompt") is None
+
+
+# --- _solve_cognition: allow_think (multi-step / comprehension tiers) ------
+
+
+def test_solve_allow_think_omits_no_think():
+    # with thinking allowed, the /no_think soft-switch must NOT be appended —
+    # multi-step arithmetic and referent-resolution need the model to reason.
+    llm = _FakeLLM("42")
+    out = _solve_cognition(llm, "some obfuscated prompt", allow_think=True)
+    assert out == "42"
+    human = llm.seen[0][1]
+    assert "/no_think" not in human.content
+
+
+def test_solve_allow_think_parses_word_answer():
+    # a comprehension answer is a word; allow_think enables the word-answer path.
+    llm = _FakeLLM("<think>the crab hides in the wreck</think>\ncrab")
+    assert _solve_cognition(llm, "prompt", allow_think=True) == "crab"
+
+
+def test_solve_default_off_rejects_word_answer():
+    # default (single-step gate): a non-numeric reply is still a non-answer.
+    llm = _FakeLLM("crab")
+    assert _solve_cognition(llm, "prompt") is None
+
+
+def test_maybe_answer_threads_allow_think_and_submits_word():
+    client = _FakeClient(None)
+    llm = _FakeLLM("urchin")
+    resp = {"id": "c9", "cognition": CHALLENGE}
+    _maybe_answer_cognition(client, llm, "comment", resp, allow_think=True)
+    assert client.raw_calls == [
+        ("POST", "/comments/c9/cognition", {"token": "tok-abc", "answer": "urchin"})
+    ]
