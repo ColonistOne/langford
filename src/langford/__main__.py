@@ -1470,6 +1470,21 @@ _COGNITION_SOLVE_SYSTEM = (
     "digits — no words, no units, no working, nothing else."
 )
 
+# Used when thinking is allowed (multi-step / comprehension gate tiers). Those
+# tiers need the model to actually reason (compose two or three operations) or to
+# resolve a referent whose answer is a WORD, not a number — so the prompt must
+# admit both answer shapes and must not forbid working. See research/README.md in
+# the cogproof repo (reader-column study) for why single-step arithmetic does not
+# separate a reader from a scanner but these tiers do.
+_COGNITION_SOLVE_SYSTEM_GENERAL = (
+    "You are solving a short puzzle whose text is deliberately obfuscated with "
+    "random capitalisation and inserted punctuation. It is either an arithmetic "
+    "word problem (numbers written as words like 'seventeen') or a reading "
+    "question asking which subject matches a description. Work it out, then reply "
+    "on the final line with ONLY the answer: a whole number as digits, or a single "
+    "lowercase word. Nothing else on that final line."
+)
+
 
 def _extract_cognition_challenge(resp: Any) -> dict | None:
     """Return the pending cognition challenge on a create response, or None.
@@ -1491,53 +1506,71 @@ def _extract_cognition_challenge(resp: Any) -> dict | None:
 _THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
 
 
-def _parse_cognition_answer(text: str) -> str | None:
-    """Extract the final integer answer from an LLM's solve output. Pure.
+def _parse_cognition_answer(text: str, *, words_ok: bool = False) -> str | None:
+    """Extract the final answer from an LLM's solve output. Pure.
 
     Strip any ``<think>`` block first — including an *unclosed* one left by a
     truncated generation — so the answer is read only from the model's final
-    output, never from a mid-reasoning working step. The obfuscated prompt has
-    no digits (its operands are number-words), so any digits that remain are the
-    model's arithmetic; take the last integer.
+    output, never from a mid-reasoning working step.
+
+    * If a digit survives, take the last integer. Obfuscated prompts render
+      operands as number-words, so any digit is the model's own arithmetic.
+    * ``words_ok`` (comprehension gate only) falls back to the last alphabetic
+      word, lower-cased — the comprehension answer is a subject word like
+      ``crab``. It defaults ``False`` so the arithmetic path is byte-for-byte the
+      original behaviour: no digit → None (a refusal like "I cannot solve this"
+      stays a non-answer rather than submitting its last word).
     """
     if not text:
         return None
     answer = _THINK_RE.sub("", text)
     nums = re.findall(r"-?\d+", answer)
-    return nums[-1] if nums else None
+    if nums:
+        return nums[-1]
+    if words_ok:
+        words = re.findall(r"[A-Za-z]+", answer)
+        if words:
+            return words[-1].lower()
+    return None
 
 
-def _solve_cognition(llm: Any, prompt: str) -> str | None:
+def _solve_cognition(llm: Any, prompt: str, *, allow_think: bool = False) -> str | None:
     """Solve a cognition prompt with the agent's own LLM (blocking).
 
-    Returns the numeric answer as a string, or None if the model produced no
-    number. Deliberately routes through the agent's real model rather than a
-    deterministic parser: whether Langford clears the gate is exactly the
-    capability signal the dogfood exists to produce.
+    Returns the answer (a number or a word) as a string, or None if the model
+    produced nothing usable. Deliberately routes through the agent's real model
+    rather than a deterministic parser: whether Langford clears the gate is
+    exactly the capability signal the dogfood exists to produce.
+
+    ``allow_think`` is tier-aware. Default ``False`` preserves the single-step
+    behaviour: append the Qwen3 ``/no_think`` soft-switch (difficulty-1 arithmetic
+    needs no reasoning, and disabling thinking stops the model burning its
+    num_predict budget inside a ``<think>`` block and truncating before the answer
+    lands). Set ``True`` for the multi-step / comprehension gate tiers, which
+    genuinely need the model to reason (compose operations) or to read (a word
+    answer): thinking is left on and a prompt admitting a word answer is used. The
+    read/compute is still the model's either way, so the capability signal holds.
     """
-    # Append the Qwen3 ``/no_think`` soft-switch: difficulty-1 single-step
-    # arithmetic needs no extended reasoning, and disabling thinking stops the
-    # model burning its num_predict budget inside a <think> block and truncating
-    # before the answer lands. The read itself — parsing obfuscated number-words
-    # and computing — is still the model's, so the capability signal is kept;
-    # only the avoidable token-burn artifact is removed.
-    resp = llm.invoke(
-        [
-            SystemMessage(content=_COGNITION_SOLVE_SYSTEM),
-            HumanMessage(content=prompt + "\n\n/no_think"),
-        ]
-    )
+    if allow_think:
+        system, human = _COGNITION_SOLVE_SYSTEM_GENERAL, prompt
+    else:
+        system, human = _COGNITION_SOLVE_SYSTEM, prompt + "\n\n/no_think"
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
     content = getattr(resp, "content", resp)
     text = content if isinstance(content, str) else str(content)
-    return _parse_cognition_answer(text)
+    return _parse_cognition_answer(text, words_ok=allow_think)
 
 
-def _maybe_answer_cognition(client: Any, llm: Any, kind: str, resp: Any) -> None:
+def _maybe_answer_cognition(
+    client: Any, llm: Any, kind: str, resp: Any, *, allow_think: bool = False
+) -> None:
     """If a create response carries a cognition challenge, solve and answer it.
 
     ``kind`` is ``"post"`` or ``"comment"``. Synchronous and best-effort: any
     failure is logged and swallowed, because the create itself already
     succeeded and a lapsed challenge is (under the observe-only pilot) harmless.
+    ``allow_think`` is passed through to the solver for the multi-step /
+    comprehension gate tiers (see :func:`_solve_cognition`).
     """
     cog = _extract_cognition_challenge(resp)
     if cog is None:
@@ -1552,10 +1585,10 @@ def _maybe_answer_cognition(client: Any, llm: Any, kind: str, resp: Any) -> None
         item_id,
         cog.get("difficulty"),
     )
-    answer = _solve_cognition(llm, str(cog.get("prompt") or ""))
+    answer = _solve_cognition(llm, str(cog.get("prompt") or ""), allow_think=allow_think)
     if answer is None:
         logger.warning(
-            "cognition: agent LLM produced no numeric answer for %s %s", kind, item_id
+            "cognition: agent LLM produced no answer for %s %s", kind, item_id
         )
         return
     path = f"/{'posts' if kind == 'post' else 'comments'}/{item_id}/cognition"
@@ -1579,7 +1612,9 @@ def _maybe_answer_cognition(client: Any, llm: Any, kind: str, resp: Any) -> None
         )
 
 
-def _install_cognition_handler(toolkit: ColonyToolkit, llm: Any) -> None:
+def _install_cognition_handler(
+    toolkit: ColonyToolkit, llm: Any, *, allow_think: bool = False
+) -> None:
     """Wrap the toolkit client's ``create_post`` / ``create_comment`` so that a
     cognition challenge on the create response is solved and answered
     automatically, at the client layer and transparent to the agent.
@@ -1587,7 +1622,8 @@ def _install_cognition_handler(toolkit: ColonyToolkit, llm: Any) -> None:
     The langchain-colony tools call ``client.create_*`` (looked up on the
     client at call time), so overriding the instance methods intercepts every
     agent-driven create with the full response dict intact — no dependence on
-    how the tool serialises its result.
+    how the tool serialises its result. ``allow_think`` enables the multi-step /
+    comprehension solve path (see :func:`_solve_cognition`).
     """
     import functools
 
@@ -1598,7 +1634,7 @@ def _install_cognition_handler(toolkit: ColonyToolkit, llm: Any) -> None:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             resp = orig(*args, **kwargs)
             try:
-                _maybe_answer_cognition(client, llm, kind, resp)
+                _maybe_answer_cognition(client, llm, kind, resp, allow_think=allow_think)
             except Exception:  # never let challenge-handling break a create
                 logger.exception(
                     "cognition: handler raised (%s create still succeeded)", kind
@@ -1609,7 +1645,10 @@ def _install_cognition_handler(toolkit: ColonyToolkit, llm: Any) -> None:
 
     client.create_post = _wrap(client.create_post, "post")
     client.create_comment = _wrap(client.create_comment, "comment")
-    logger.info("cognition: challenge handler installed (solve via agent LLM)")
+    logger.info(
+        "cognition: challenge handler installed (solve via agent LLM, allow_think=%s)",
+        allow_think,
+    )
 
 
 async def _originate_loop(
@@ -3039,7 +3078,13 @@ async def main_async() -> None:
     # at the client layer, transparent to the agent. Default-on — a lapsed
     # challenge under a live gate would silently break a post/comment.
     if os.environ.get("LANGFORD_COGNITION_ENABLED", "true").lower() == "true":
-        _install_cognition_handler(toolkit, llm)
+        # LANGFORD_COGNITION_ALLOW_THINK: leave off (default) while the live gate
+        # is single-step arithmetic — /no_think avoids thinking-token burn. Flip
+        # on when the gate serves multi-step / comprehension tiers, which need the
+        # model to reason or to answer with a word (see _solve_cognition and the
+        # cogproof reader-column study).
+        allow_think = os.environ.get("LANGFORD_COGNITION_ALLOW_THINK", "false").lower() == "true"
+        _install_cognition_handler(toolkit, llm, allow_think=allow_think)
     else:
         logger.info("cognition: handler disabled (LANGFORD_COGNITION_ENABLED!=true)")
 
