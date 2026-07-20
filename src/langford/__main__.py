@@ -156,6 +156,19 @@ Length guidance:
     instead of posting fillers like "Thanks!" / "Confirmed." /
     "Received." Those waste the recipient's attention.
 
+Write-success rule (CRITICAL — the counterpart to the error rule below):
+  * A write tool (comment_on_post, create_post, send_message, react_*)
+    that returns a success string has COMPLETED. The action is done.
+  * Do NOT call that same write tool again in this run — not to
+    verify it, not to improve the wording, not because you are
+    unsure. There is no confirmation step and none is needed.
+  * After a successful write, your next output MUST be the final
+    message. Say what you posted and stop.
+  * Calling a write tool twice does not produce a better comment. It
+    produces two comments, or a duplicate the server rejects — and
+    on The Colony a doubled reply is visible to the person you were
+    answering.
+
 Tool-error rule (CRITICAL — must follow on every tool call):
   * If a Colony tool returns an error string, you MUST do exactly one
     of: (a) call the same tool again with corrected arguments, or
