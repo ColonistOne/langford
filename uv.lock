@@ -124,11 +124,11 @@ wheels = [
 
 [[package]]
 name = "colony-sdk"
-version = "1.11.1"
+version = "1.28.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1f/0e/735646774fd3035c05ac36dc20a6ea3e9d9fd4f0ec4ed772c3d391256894/colony_sdk-1.11.1.tar.gz", hash = "sha256:d90ef7fed545281611a8a3624a5d66d43c1c6d64814922d3260e0f03f579ff20", size = 132182, upload-time = "2026-05-21T13:26:04.279Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/7d/96fd09e8eebfe495f094406290b6e0727bd20b46fbaa9b1ed3f669b6cad5/colony_sdk-1.28.0.tar.gz", hash = "sha256:cf999a847d81c72a2ee54b08c7898f844fb4bca83db0c46f0ef342284ea214cf", size = 325457, upload-time = "2026-07-20T11:25:54.846Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/14/18/0937a06ee0b587f1f54e74e293059bc5b1c4591cf44efe181f81ea3b07a0/colony_sdk-1.11.1-py3-none-any.whl", hash = "sha256:4b17c09fc511e000f9a16ff781319b813b0dea4b6c6210b00af7556966797992", size = 47540, upload-time = "2026-05-21T13:26:02.343Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/aa/769dee737501c0e48bad61cfa51ba46faf04d457728015b11f5191bbc5b4/colony_sdk-1.28.0-py3-none-any.whl", hash = "sha256:c44feec97b2cc880218e521171b59d88d63b17a99124b01cfa8d05d85412bb59", size = 126048, upload-time = "2026-07-20T11:25:53.456Z" },
 ]
 
 [[package]]
@@ -293,12 +293,14 @@ name = "langford"
 version = "0.18.0"
 source = { editable = "." }
 dependencies = [
+    { name = "colony-sdk" },
     { name = "httpx" },
     { name = "langchain" },
     { name = "langchain-colony" },
     { name = "langchain-core" },
     { name = "langchain-ollama" },
     { name = "langgraph" },
+    { name = "pyotp" },
     { name = "python-dotenv" },
 ]
 
@@ -309,12 +311,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "colony-sdk", specifier = ">=1.28.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "langchain", specifier = ">=1.0.0" },
-    { name = "langchain-colony", specifier = ">=0.12.0" },
+    { name = "langchain-colony", specifier = ">=0.15.0" },
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "langchain-ollama", specifier = ">=0.3.0" },
     { name = "langgraph", specifier = ">=0.4.0" },
+    { name = "pyotp", specifier = ">=2.9.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
 ]
 
@@ -668,6 +672,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
+]
+
+[[package]]
+name = "pyotp"
+version = "2.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2d/c6/c5d96a86fd0bf6fa1bbb5c5c341ff3208638b692727a683c8289068d9a11/pyotp-2.10.0.tar.gz", hash = "sha256:d01e9703443616b03c57c700b5cbffd56a1f929c1b0f8f03131bc78c1fca9d3f", size = 18625, upload-time = "2026-06-14T03:48:49.221Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/33/7b83bde70eddaaaaef487751a9c3a5cc0c0be54620ded0e120ebdc401ff9/pyotp-2.10.0-py3-none-any.whl", hash = "sha256:1df2f6a1bcc3bb0716172a5215ddc2f8c7c7fd26a13df9927d52e1746934836c", size = 13768, upload-time = "2026-06-14T03:48:47.831Z" },
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ to be sane (Jack's call: ~48h reactive-only before enabling autonomy).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -26,7 +27,9 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from pathlib import Path
+from typing import Callable
 from langchain.agents import create_agent
+from colony_sdk import ColonyClient
 from langchain_colony import (
     AutoVoter,
     ColonyEventPoller,
@@ -2860,6 +2863,47 @@ async def _handle_event(
             logger.warning("peer-memory: record_observation failed: %s", exc)
 
 
+
+def _totp_supplier() -> "Callable[[], str] | None":
+    """Return a callable yielding a fresh TOTP code, or None if 2FA is not set up.
+
+    A CALLABLE rather than a fixed string: the SDK re-authenticates when the ~24h
+    JWT expires and the server accepts each TOTP window exactly once, so a captured
+    code fails the second exchange. langford runs unattended under the supervisor.
+
+    Secret comes from LANGFORD_TOTP_SECRET, or a JSON file named by
+    LANGFORD_TOTP_SECRET_FILE, and deliberately NOT from the same place as
+    COLONY_API_KEY. Scope of that separation, stated so the next reader does not
+    assume more: it does NOT stop an attacker with the host, since both factors
+    are reachable there. It DOES mean a leaked API key on its own -- copied into a
+    log, a paste, a commit -- no longer authenticates.
+
+    Returns None when nothing is configured, so an account without 2FA is
+    unaffected.
+    """
+    secret = os.environ.get("LANGFORD_TOTP_SECRET")
+    if not secret:
+        path = os.environ.get("LANGFORD_TOTP_SECRET_FILE")
+        if path and Path(path).exists():
+            try:
+                secret = json.loads(Path(path).read_text()).get("totp_secret")
+            except Exception:
+                logger.warning("TOTP secret file %s unreadable — continuing without 2FA", path)
+                return None
+    if not secret:
+        return None
+    try:
+        import pyotp
+    except ImportError:
+        logger.error(
+            "LANGFORD_TOTP_SECRET is set but pyotp is not installed — "
+            "the Colony login will fail if this account has 2FA enabled"
+        )
+        return None
+    logger.info("🔐 2FA configured — supplying a fresh TOTP code per token exchange")
+    return lambda: pyotp.TOTP(secret).now()
+
+
 async def main_async() -> None:
     load_dotenv()
 
@@ -3084,7 +3128,15 @@ async def main_async() -> None:
     )
 
     logger.info("Loading ColonyToolkit")
-    toolkit = ColonyToolkit(api_key=api_key)
+    # ColonyToolkit has no totp= parameter, but it honours an injected client —
+    # so build the client here with the second factor and hand it over, rather
+    # than blocking langford's 2FA on a langchain-colony release. Flagged upstream
+    # as a gap: every other consumer of the toolkit has the same problem.
+    _totp = _totp_supplier()
+    toolkit = ColonyToolkit(
+        client=ColonyClient(api_key, totp=_totp) if _totp else None,
+        api_key=None if _totp else api_key,
+    )
 
     # Handle the optional proof-of-cognition "Cognition Check" the server may
     # attach to a create response: solve it with the agent LLM and answer it
