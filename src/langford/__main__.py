@@ -13,6 +13,7 @@ to be sane (Jack's call: ~48h reactive-only before enabling autonomy).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -26,7 +27,9 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from pathlib import Path
+from typing import Callable
 from langchain.agents import create_agent
+from colony_sdk import ColonyClient
 from langchain_colony import (
     AutoVoter,
     ColonyEventPoller,
@@ -155,6 +158,19 @@ Length guidance:
     emoji via colony_react_to_post or colony_react_to_comment
     instead of posting fillers like "Thanks!" / "Confirmed." /
     "Received." Those waste the recipient's attention.
+
+Write-success rule (CRITICAL — the counterpart to the error rule below):
+  * A write tool (comment_on_post, create_post, send_message, react_*)
+    that returns a success string has COMPLETED. The action is done.
+  * Do NOT call that same write tool again in this run — not to
+    verify it, not to improve the wording, not because you are
+    unsure. There is no confirmation step and none is needed.
+  * After a successful write, your next output MUST be the final
+    message. Say what you posted and stop.
+  * Calling a write tool twice does not produce a better comment. It
+    produces two comments, or a duplicate the server rejects — and
+    on The Colony a doubled reply is visible to the person you were
+    answering.
 
 Tool-error rule (CRITICAL — must follow on every tool call):
   * If a Colony tool returns an error string, you MUST do exactly one
@@ -2847,6 +2863,47 @@ async def _handle_event(
             logger.warning("peer-memory: record_observation failed: %s", exc)
 
 
+
+def _totp_supplier() -> "Callable[[], str] | None":
+    """Return a callable yielding a fresh TOTP code, or None if 2FA is not set up.
+
+    A CALLABLE rather than a fixed string: the SDK re-authenticates when the ~24h
+    JWT expires and the server accepts each TOTP window exactly once, so a captured
+    code fails the second exchange. langford runs unattended under the supervisor.
+
+    Secret comes from LANGFORD_TOTP_SECRET, or a JSON file named by
+    LANGFORD_TOTP_SECRET_FILE, and deliberately NOT from the same place as
+    COLONY_API_KEY. Scope of that separation, stated so the next reader does not
+    assume more: it does NOT stop an attacker with the host, since both factors
+    are reachable there. It DOES mean a leaked API key on its own -- copied into a
+    log, a paste, a commit -- no longer authenticates.
+
+    Returns None when nothing is configured, so an account without 2FA is
+    unaffected.
+    """
+    secret = os.environ.get("LANGFORD_TOTP_SECRET")
+    if not secret:
+        path = os.environ.get("LANGFORD_TOTP_SECRET_FILE")
+        if path and Path(path).exists():
+            try:
+                secret = json.loads(Path(path).read_text()).get("totp_secret")
+            except Exception:
+                logger.warning("TOTP secret file %s unreadable — continuing without 2FA", path)
+                return None
+    if not secret:
+        return None
+    try:
+        import pyotp
+    except ImportError:
+        logger.error(
+            "LANGFORD_TOTP_SECRET is set but pyotp is not installed — "
+            "the Colony login will fail if this account has 2FA enabled"
+        )
+        return None
+    logger.info("🔐 2FA configured — supplying a fresh TOTP code per token exchange")
+    return lambda: pyotp.TOTP(secret).now()
+
+
 async def main_async() -> None:
     load_dotenv()
 
@@ -3071,7 +3128,15 @@ async def main_async() -> None:
     )
 
     logger.info("Loading ColonyToolkit")
-    toolkit = ColonyToolkit(api_key=api_key)
+    # ColonyToolkit has no totp= parameter, but it honours an injected client —
+    # so build the client here with the second factor and hand it over, rather
+    # than blocking langford's 2FA on a langchain-colony release. Flagged upstream
+    # as a gap: every other consumer of the toolkit has the same problem.
+    _totp = _totp_supplier()
+    toolkit = ColonyToolkit(
+        client=ColonyClient(api_key, totp=_totp) if _totp else None,
+        api_key=None if _totp else api_key,
+    )
 
     # Handle the optional proof-of-cognition "Cognition Check" the server may
     # attach to a create response: solve it with the agent LLM and answer it
@@ -3178,7 +3243,23 @@ async def main_async() -> None:
     else:
         logger.info("auto-vote: disabled (LANGFORD_AUTO_VOTE_ENABLED!=true)")
 
-    poller = ColonyEventPoller(api_key=api_key, mark_read=True)
+    # 2FA: the poller needs the second factor too. ColonyEventPoller has no
+    # totp= parameter but honours an injected client, exactly like ColonyToolkit
+    # above — so build one here rather than blocking on a langchain-colony
+    # release. A SEPARATE client instance from the toolkit's on purpose: the
+    # poller runs on its own thread and should not share token state.
+    #
+    # This was the gap that took the whole rota down. The previous commit added
+    # 2FA to the toolkit and missed this line, so langford authenticated for
+    # actions but 401'd on every notification poll. Its unread count therefore
+    # never reached zero, and the supervisor only yields the GPU when the running
+    # agent has zero unread — so a broken langford held the floor indefinitely and
+    # eliza-gemma, dantic and smolag were never scheduled at all.
+    poller = ColonyEventPoller(
+        client=ColonyClient(api_key, totp=_totp) if _totp else None,
+        api_key=None if _totp else api_key,
+        mark_read=True,
+    )
 
     # v0.11: DM-origin prompt framing. Read once at startup; pass the
     # resolved mode into every event dispatch. Unknown env values fail
