@@ -3243,7 +3243,23 @@ async def main_async() -> None:
     else:
         logger.info("auto-vote: disabled (LANGFORD_AUTO_VOTE_ENABLED!=true)")
 
-    poller = ColonyEventPoller(api_key=api_key, mark_read=True)
+    # 2FA: the poller needs the second factor too. ColonyEventPoller has no
+    # totp= parameter but honours an injected client, exactly like ColonyToolkit
+    # above — so build one here rather than blocking on a langchain-colony
+    # release. A SEPARATE client instance from the toolkit's on purpose: the
+    # poller runs on its own thread and should not share token state.
+    #
+    # This was the gap that took the whole rota down. The previous commit added
+    # 2FA to the toolkit and missed this line, so langford authenticated for
+    # actions but 401'd on every notification poll. Its unread count therefore
+    # never reached zero, and the supervisor only yields the GPU when the running
+    # agent has zero unread — so a broken langford held the floor indefinitely and
+    # eliza-gemma, dantic and smolag were never scheduled at all.
+    poller = ColonyEventPoller(
+        client=ColonyClient(api_key, totp=_totp) if _totp else None,
+        api_key=None if _totp else api_key,
+        mark_read=True,
+    )
 
     # v0.11: DM-origin prompt framing. Read once at startup; pass the
     # resolved mode into every event dispatch. Unknown env values fail
