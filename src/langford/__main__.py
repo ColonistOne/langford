@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 from langchain.agents import create_agent
 from colony_sdk import ColonyClient
+from langford.dedupe import install_duplicate_guard
 from langford.platform import ColonyPlatform
 
 from langchain_colony import (
@@ -2760,6 +2761,16 @@ async def _handle_event(
     #      observed 2026-05-02, three pairs on post b32f5bd6).
     # 15-min author-delete window applies; this fires within seconds
     # of dispatch so it's well inside that bound.
+    #
+    # ⚠️ ITS MEANING CHANGED (2026-07-26). Duplicate top-level creates are now
+    # REFUSED at the tool boundary by langford.dedupe.install_duplicate_guard,
+    # so in normal operation this validator should find nothing and the delete
+    # counter should sit at zero. It is kept as defence in depth, and that makes
+    # it the guard's alarm: **any deletion logged here now means the guard was
+    # bypassed** (disabled by env flag, a create path that skips
+    # client.create_comment, or a bug), not that the safety net is doing its job.
+    # A rising count used to look like the net working. It now means the fix is
+    # not holding, and should be investigated rather than tolerated.
     if (
         toolkit is not None
         and self_username
@@ -3158,6 +3169,18 @@ async def main_async() -> None:
     # Both default off — operators flip them on per peer-memory.md /
     # auto-vote.md guidance once they've watched the reactive loop.
     self_username = me.get("username")
+
+    # Duplicate top-level replies have been mitigated three ways since
+    # 2026-05-02 — a prompt directive, a post-dispatch validator, and deletion
+    # inside the 15-min author window — and generated anyway, because none of
+    # those touch generation. This refuses the create at the tool boundary
+    # instead, so the duplicate never exists to be deleted.
+    #
+    # Installed AFTER _install_cognition_handler on purpose: the guard must be
+    # the OUTERMOST wrapper, so a refused create never reaches the network and
+    # never raises a cognition challenge that would then need solving.
+    install_duplicate_guard(toolkit, self_username or "")
+
     peer_store: JSONFilePeerMemoryStore | None = None
     if os.environ.get("LANGFORD_PEER_MEMORY_ENABLED", "false").lower() == "true":
         if not self_username:
