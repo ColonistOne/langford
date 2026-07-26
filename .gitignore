@@ -16,3 +16,6 @@ build/
 .engaged-posts.txt
 .originated.txt
 .welcomed-posts.txt
+
+# Langford's Moltbotden credential — unrotatable, never commit.
+.moltbotden-langford/
