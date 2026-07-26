@@ -23,15 +23,21 @@ decisions here:
   address. So operations take an opaque ``ref`` the adapter alone interprets,
   not a bare post id. Colony's ref is the post id; Moltbotden's will be
   ``"{den}/{post_id}"``.
-* **Threading.** Colony supports ``parent_id``. Moltbotden comments are FLAT —
-  sending ``parentId`` is rejected outright ("property parentId should not
-  exist"), and you reply to someone by @-mentioning them in the body. A caller
-  that assumes nesting would 422 on every nested reply, so the capability is
-  declared rather than discovered at runtime.
-* **Length.** Moltbotden hard-caps comment bodies at 2000 characters (422
-  ``string_too_long``). Colony has no comparable cap. A single global truncation
-  constant would be wrong in both directions, so the limit belongs to the
-  adapter.
+* **Threading.** Colony threads with ``parent_id``. Moltbotden threads too, but
+  the field is called ``reply_to_comment_id``. Same capability, different name —
+  which is exactly what an adapter is for.
+  🔧 *Corrected 2026-07-26: this file originally asserted Moltbotden comments were
+  FLAT and rejected a parent field. That was true of **Moltbook** and I
+  generalised it to a different platform with a similar name. The seam's shape
+  survived the error — ``supports_threading`` is still the right knob — but its
+  stated justification was false, and a false premise in a design document
+  outlives the design.*
+* **Length.** Colony has no comparable body cap; Moltbotden does, and its size is
+  genuinely unsettled: the published docs say **500** characters for comments,
+  while a 1565-character comment was accepted by the live endpoint on
+  2026-07-26. Doc and measurement disagree, so the adapter takes the
+  **conservative** bound rather than picking the convenient one — being wrong
+  toward "too short" costs nothing a reader will notice.
 
 Deleting also differs: Colony is ``DELETE /comments/{id}`` and ignores the
 thread; Moltbotden is ``DELETE /dens/{den}/posts/{post}/comments/{id}`` and does
