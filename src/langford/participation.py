@@ -44,11 +44,12 @@ DECLINED_ALREADY_REPLIED = "declined_already_replied"
 DECLINED_EMPTY_COMPOSE = "declined_empty_compose"  # the model chose silence
 COULD_NOT_REACH = "could_not_reach"             # platform unreachable — NOT silence
 REFUSED_TOO_LONG = "refused_too_long"
+RETRACTED = "retracted"                          # a POSTED row later withdrawn
 
 DECISIONS = frozenset({
     POSTED, DECLINED_CADENCE, DECLINED_DAILY_CAP, DECLINED_NO_CANDIDATE,
     DECLINED_ALREADY_REPLIED, DECLINED_EMPTY_COMPOSE, COULD_NOT_REACH,
-    REFUSED_TOO_LONG,
+    REFUSED_TOO_LONG, RETRACTED,
 })
 
 
@@ -114,9 +115,25 @@ class CadenceGate:
 
     # -- policy ---------------------------------------------------------------
 
+    @staticmethod
+    def _counts_as_post(r: dict) -> bool:
+        """A POSTED row that was later retracted did not consume the cadence.
+
+        The comment does not stand, so nobody saw it and nothing was spent. The
+        row STAYS in the ledger — the ledger records what happened, not what I
+        wish had — but it must not gate the next attempt, or a malformed post
+        would buy 30 hours of silence it never earned.
+
+        ⚠️ This is a small abuse surface: post badly, retract, post again. It is
+        acceptable only because retraction requires a maintainer action and is
+        itself logged. If retraction ever becomes automatic, this must be
+        revisited — a self-retracting agent would have an unlimited budget.
+        """
+        return r.get("decision") == POSTED and not r.get("retracted")
+
     def last_post_at(self) -> datetime | None:
         for r in reversed(self._rows()):
-            if r.get("decision") == POSTED:
+            if self._counts_as_post(r):
                 try:
                     return datetime.fromisoformat(r["at"])
                 except (KeyError, ValueError):
@@ -127,7 +144,7 @@ class CadenceGate:
         today = self.now().date()
         n = 0
         for r in self._rows():
-            if r.get("decision") != POSTED:
+            if not self._counts_as_post(r):
                 continue
             try:
                 if datetime.fromisoformat(r["at"]).date() == today:
@@ -143,7 +160,7 @@ class CadenceGate:
         it fails we still refuse to speak twice somewhere we know we have been.
         """
         return {r["ref"] for r in self._rows()
-                if r.get("decision") == POSTED and isinstance(r.get("ref"), str)}
+                if self._counts_as_post(r) and isinstance(r.get("ref"), str)}
 
     def blocked_reason(self) -> str | None:
         """Why this run must not post, or None if posting is permitted."""

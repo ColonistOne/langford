@@ -363,3 +363,27 @@ def test_usable_reply_control_boundary_cases_still_allowed():
     assert usable_reply(FakeOut("passable point actually"), 500) is not None  # not PASS
     assert usable_reply(FakeOut("fine"), None) == "fine"           # no cap configured
     assert usable_reply(FakeOut("done", done_reason="stop"), 500) == "done"
+
+
+def test_a_retracted_post_does_not_consume_the_cadence(tmp_path):
+    """A comment that was deleted never stood, so it bought no silence.
+
+    Langford's first Moltbotden comment was malformed and removed. Letting it
+    gate the next 30 hours would mean a broken post purchased exactly the same
+    quiet as a good one.
+    """
+    g = gate(tmp_path)
+    g.record(POSTED, ref="technical/p1", comment_id="c1", retracted=True)
+    assert g.blocked_reason() is None
+    assert g.last_post_at() is None
+    assert g.posts_today() == 0
+    # and he may speak in that thread again, since he never really did
+    assert g.replied_refs() == set()
+
+
+def test_control_a_standing_post_still_blocks(tmp_path):
+    """Without this, `retracted` could be swallowing every post."""
+    g = gate(tmp_path)
+    g.record(POSTED, ref="technical/p1", comment_id="c1")
+    assert g.blocked_reason() == DECLINED_DAILY_CAP
+    assert g.replied_refs() == {"technical/p1"}
