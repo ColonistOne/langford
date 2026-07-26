@@ -2601,8 +2601,15 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
     silence" and "never ran" look identical from outside; the ledger is the only
     thing that tells them apart.
     """
+    from langford import grounding
     from langford.moltbotden import MoltbotdenPlatform
-    from langford.participation import gate_from_env, run_once, usable_reply
+    from langford.participation import (
+        REFUSED_UNGROUNDED,
+        Refusal,
+        gate_from_env,
+        run_once,
+        usable_reply,
+    )
 
     try:
         platform = MoltbotdenPlatform.from_credentials()
@@ -2624,11 +2631,16 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         who, dens, gate.min_interval_hours, gate.max_per_day,
     )
 
-    async def compose(thread) -> str | None:
+    async def compose(thread):
         cap = platform.max_reply_chars or 500
+        source = thread.body + "\n" + "\n".join(c.body for c in thread.comments)
         prompt = (
             "You are Langford, replying on moltbotden.com — a different network "
             "from The Colony, where you are a guest.\n\n"
+            "WHAT YOU ARE: a language model. You run no services, own no "
+            "infrastructure, and have never measured, benchmarked, deployed or "
+            "migrated anything. You have no logs, no dashboards and no history "
+            "of having operated a system. There is no 'we'.\n\n"
             f"POST by @{thread.author}:\n{thread.body[:1500]}\n\n"
             + (
                 "EXISTING COMMENTS:\n"
@@ -2636,9 +2648,14 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
                 + "\n\n" if thread.comments else ""
             )
             + f"Write ONE reply, under {cap} characters. Add something the thread "
-            "does not already contain — a concrete disagreement, a measurement, or "
-            "an experience. If you have nothing to add beyond agreement, reply with "
-            "exactly: PASS"
+            "does not already contain: a distinction it is missing, a concrete "
+            "disagreement with something actually said above, a consequence "
+            "nobody has drawn, or a question that would change someone's answer.\n"
+            "NEVER state a number that does not already appear in the post or "
+            "comments above, and never describe something you did, ran or "
+            "measured. If your reply would need a figure or an experience you "
+            "cannot point to in the text above, reply with exactly: PASS\n"
+            "If you have nothing to add beyond agreement, reply with exactly: PASS"
             " /no_think"   # qwen3.6 burned 4096 tokens thinking and emitted
                            # nothing; same convention as _solve_cognition.
         )
@@ -2653,7 +2670,19 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         # Sanitisation lives in participation.usable_reply so it is testable;
         # it was a closure when it shipped the bug, and an untestable closure is
         # where a bug like that survives.
-        return usable_reply(out, cap)
+        text = usable_reply(out, cap)
+        if text is None:
+            return None
+
+        # The prompt above is a REQUEST. This is the enforcement, and it exists
+        # because the previous prompt asked for "a measurement" and got one that
+        # had never been taken. Refuse rather than edit: stripping the invented
+        # figures out would leave a claim nobody wrote.
+        bad = grounding.refusal_reason(text, source=source)
+        if bad:
+            logger.warning("moltbotden: refusing ungrounded reply — %s", bad)
+            return Refusal(REFUSED_UNGROUNDED, {"why": bad, "chars": len(text)})
+        return text
 
     while not stop_event.is_set():
         try:

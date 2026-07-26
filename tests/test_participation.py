@@ -34,11 +34,13 @@ from langford.participation import (
     DECLINED_NO_CANDIDATE,
     POSTED,
     REFUSED_TOO_LONG,
+    REFUSED_UNGROUNDED,
     CadenceGate,
+    Refusal,
     run_once,
     usable_reply,
 )
-from langford.platform import Platform
+from langford.platform import Comment, Platform
 
 ME = "langford"
 T0 = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
@@ -202,9 +204,12 @@ def test_happy_path_posts_and_records(tmp_path):
         (lambda: (FakePlatform(posts=[_post()], thread=_thread()), lambda t: ""), DECLINED_EMPTY_COMPOSE),
         (lambda: (FakePlatform(posts=[_post()], thread=_thread()), lambda t: "z" * 600), REFUSED_TOO_LONG),
         (lambda: (FakePlatform(posts=[_post()], thread=_thread(), reply_id=None), lambda t: "x"), COULD_NOT_REACH),
+        (lambda: (FakePlatform(posts=[_post()], thread=_thread()),
+                  lambda t: Refusal(REFUSED_UNGROUNDED, {"why": "invented a figure"})),
+         REFUSED_UNGROUNDED),
     ],
     ids=["den-unreachable", "no-candidate", "thread-unreachable",
-         "model-chose-silence", "too-long", "reply-failed"],
+         "model-chose-silence", "too-long", "reply-failed", "ungrounded"],
 )
 def test_every_path_records_exactly_one_row(tmp_path, make, expected):
     """No path may exit without a record — that is the whole contract."""
@@ -213,6 +218,69 @@ def test_every_path_records_exactly_one_row(tmp_path, make, expected):
     row = _run(run_once(platform, g, compose, dens=["technical"]))
     assert row["decision"] == expected
     assert len(rows(g)) == 1, "exactly one row per run"
+
+
+def test_every_decision_value_is_emitted_by_some_fixture(tmp_path):
+    """Verdict coverage, not branch coverage.
+
+    Added when REFUSED_UNGROUNDED was introduced and the parametrised list above
+    kept passing without it — a new terminal state that no fixture produced, and
+    nothing went red. "The branch is reachable" and "some test reached it" are
+    different claims, and only the second is evidence.
+
+    Self-contained on purpose: collecting verdicts from the other tests via a
+    shared fixture would make this pass or fail on test ORDER, and a coverage
+    check whose result depends on ordering is not a coverage check.
+
+    RETRACTED is excluded by name: it is applied to an existing row after the
+    fact by a maintainer, so run_once cannot emit it. Naming the exclusion keeps
+    the hole visible instead of letting the expected set quietly shrink.
+    """
+    from langford.participation import DECISIONS, RETRACTED
+
+    ok = FakePlatform(posts=[_post()], thread=_thread())
+    producers = {
+        POSTED: (ok, lambda t: "a real reply", {}),
+        COULD_NOT_REACH: (FakePlatform(raise_list=True), lambda t: "x", {}),
+        DECLINED_NO_CANDIDATE: (FakePlatform(posts=[]), lambda t: "x", {}),
+        DECLINED_EMPTY_COMPOSE: (ok, lambda t: "", {}),
+        REFUSED_TOO_LONG: (ok, lambda t: "z" * 600, {}),
+        REFUSED_UNGROUNDED: (
+            ok, lambda t: Refusal(REFUSED_UNGROUNDED, {"why": "invented a figure"}), {}),
+        # max_per_day must be raised here or the daily cap fires first and this
+        # "cadence" fixture silently tests the cap instead — a producer that
+        # emits the wrong verdict is worse than none, since it reads as coverage.
+        DECLINED_CADENCE: (ok, lambda t: "x",
+                           {"min_interval_hours": 999, "max_per_day": 99}),
+        DECLINED_DAILY_CAP: (ok, lambda t: "x", {"max_per_day": 0}),
+        # This one had NO producer anywhere in the suite before this test was
+        # written — a terminal state that existed, was reachable, and had never
+        # been shown to be reached. Exactly the hole the test is for.
+        DECLINED_ALREADY_REPLIED: (
+            FakePlatform(
+                posts=[_post()],
+                thread=_thread(comments=[Comment(id="c0", author=ME, body="mine")]),
+            ),
+            lambda t: "x", {}),
+    }
+    expected = set(DECISIONS) - {RETRACTED}
+    assert set(producers) == expected, (
+        f"no producer for {sorted(expected - set(producers))} — a decision value "
+        "exists that no test can make the code emit")
+
+    emitted = set()
+    for want, (platform, compose, gate_kw) in producers.items():
+        g = gate(tmp_path / want, **gate_kw)
+        if want in (DECLINED_CADENCE, DECLINED_DAILY_CAP):
+            g.record(POSTED, ref="technical/seed")  # prior activity to be blocked by
+        row = _run(run_once(platform, g, compose, dens=["technical"]))
+        emitted.add(row["decision"])
+        assert row["decision"] == want, f"wanted {want}, got {row['decision']}"
+
+    missing = expected - emitted
+    assert not missing, (
+        f"decision value(s) {sorted(missing)} are defined but never produced — "
+        "an unemitted verdict is untested however green the suite looks")
 
 
 def test_unreachable_is_not_filed_as_silence(tmp_path):
