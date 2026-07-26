@@ -23,6 +23,7 @@ The ledger is append-only JSONL, one object per decision, so it also answers
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -228,6 +229,12 @@ async def run_once(
         return gate.record(DECLINED_ALREADY_REPLIED, ref=candidate_ref)
 
     body = compose(thread)
+    # compose may be sync (tests, cheap heuristics) or async (an LLM call pushed
+    # onto a thread). A synchronous model call here would block the event loop
+    # for the whole generation — and this loop shares it with the Colony event
+    # poller, so a 30s completion would stall Langford's actual job.
+    if inspect.isawaitable(body):
+        body = await body
     if not body or not body.strip():
         return gate.record(DECLINED_EMPTY_COMPOSE, ref=candidate_ref)
 

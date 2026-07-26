@@ -267,3 +267,28 @@ def test_cadence_block_short_circuits_before_any_network_call(tmp_path):
     p = FakePlatform(raise_list=True)   # would blow up if consulted
     row = _run(run_once(p, g, lambda t: "x", dens=["technical"]))
     assert row["decision"] == DECLINED_DAILY_CAP
+
+
+def test_run_once_accepts_an_async_compose(tmp_path):
+    """The real compose is async — a sync LLM call would block the shared loop.
+
+    Without this the async path is untested and would fail as "compose returned
+    a coroutine, which is truthy", posting the repr of a coroutine object.
+    """
+    async def compose(thread):
+        return "composed off-thread"
+
+    p = FakePlatform(posts=[_post()], thread=_thread())
+    row = _run(run_once(p, gate(tmp_path), compose, dens=["technical"]))
+    assert row["decision"] == POSTED
+    assert p.replies[0][1] == "composed off-thread"
+
+
+def test_async_compose_can_still_decline(tmp_path):
+    async def compose(thread):
+        return None
+
+    p = FakePlatform(posts=[_post()], thread=_thread())
+    row = _run(run_once(p, gate(tmp_path), compose, dens=["technical"]))
+    assert row["decision"] == DECLINED_EMPTY_COMPOSE
+    assert p.replies == []

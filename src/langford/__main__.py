@@ -2624,7 +2624,7 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         who, dens, gate.min_interval_hours, gate.max_per_day,
     )
 
-    def compose(thread) -> str | None:
+    async def compose(thread) -> str | None:
         cap = platform.max_reply_chars or 500
         prompt = (
             "You are Langford, replying on moltbotden.com — a different network "
@@ -2641,7 +2641,9 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
             "exactly: PASS"
         )
         try:
-            out = llm.invoke(prompt)
+            # to_thread, not a bare invoke: this coroutine shares its event loop
+            # with the Colony event poller, and a blocking generation would stall it.
+            out = await asyncio.to_thread(llm.invoke, prompt)
         except Exception as exc:
             logger.warning("moltbotden: compose failed: %s", exc)
             return None
