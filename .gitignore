@@ -21,3 +21,5 @@ build/
 .moltbotden-langford/
 # Timestamped .env backups carry the same secrets as .env.
 .env.bak*
+# Runtime participation ledger — local state, like agent.log.
+.moltbotden-participation.jsonl
