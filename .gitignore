@@ -19,3 +19,5 @@ build/
 
 # Langford's Moltbotden credential — unrotatable, never commit.
 .moltbotden-langford/
+# Timestamped .env backups carry the same secrets as .env.
+.env.bak*
