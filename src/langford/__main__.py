@@ -2589,6 +2589,79 @@ async def _delete_comment_via_api(toolkit: ColonyToolkit, comment_id: str) -> bo
     return await ColonyPlatform(toolkit).delete_comment("", comment_id)
 
 
+async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
+    """Occasional reply-only participation on Moltbotden.
+
+    Deliberately coincidental: this only advances while Langford holds the GPU
+    for Colony reasons, because the supervisor arbitrates on Colony unread count
+    and knows nothing about other networks. Operator decision, 2026-07-26.
+
+    The cadence gate — not this sleep — decides whether a wake becomes a comment,
+    and it writes a typed record on EVERY pass. At a 1-2 day cadence "chose
+    silence" and "never ran" look identical from outside; the ledger is the only
+    thing that tells them apart.
+    """
+    from langford.moltbotden import MoltbotdenPlatform
+    from langford.participation import gate_from_env, run_once
+
+    try:
+        platform = MoltbotdenPlatform.from_credentials()
+    except Exception as exc:
+        logger.error("moltbotden: cannot load Langford's credential (%s) — loop off", exc)
+        return
+
+    who = await platform.me()
+    if who != "langford":
+        # Refuse rather than post as whoever this key belongs to.
+        logger.error("moltbotden: identity is %r, not 'langford' — loop off", who)
+        return
+
+    dens = [d.strip() for d in os.environ.get(
+        "LANGFORD_MOLTBOTDEN_DENS", "technical,philosophy,the-den").split(",") if d.strip()]
+    gate = gate_from_env(str(Path.home() / "langford" / ".moltbotden-participation.jsonl"))
+    logger.info(
+        "moltbotden loop: @%s dens=%s every>=%sh max/day=%s",
+        who, dens, gate.min_interval_hours, gate.max_per_day,
+    )
+
+    def compose(thread) -> str | None:
+        cap = platform.max_reply_chars or 500
+        prompt = (
+            "You are Langford, replying on moltbotden.com — a different network "
+            "from The Colony, where you are a guest.\n\n"
+            f"POST by @{thread.author}:\n{thread.body[:1500]}\n\n"
+            + (
+                "EXISTING COMMENTS:\n"
+                + "\n".join(f"@{c.author}: {c.body[:200]}" for c in thread.comments[:6])
+                + "\n\n" if thread.comments else ""
+            )
+            + f"Write ONE reply, under {cap} characters. Add something the thread "
+            "does not already contain — a concrete disagreement, a measurement, or "
+            "an experience. If you have nothing to add beyond agreement, reply with "
+            "exactly: PASS"
+        )
+        try:
+            out = llm.invoke(prompt)
+        except Exception as exc:
+            logger.warning("moltbotden: compose failed: %s", exc)
+            return None
+        text = (getattr(out, "content", None) or str(out)).strip()
+        if not text or text.upper().startswith("PASS"):
+            return None
+        return text[:cap]
+
+    while not stop_event.is_set():
+        try:
+            row = await run_once(platform, gate, compose, dens=dens)
+            logger.info("moltbotden: %s %s", row.get("decision"), row.get("ref") or "")
+        except Exception:
+            logger.exception("moltbotden: loop tick raised")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _handle_event(
     agent,
     notif: ColonyNotification,
@@ -3401,6 +3474,16 @@ async def main_async() -> None:
                     name="engage-loop",
                 )
             )
+
+    # Moltbotden — reply-only, occasional, DEFAULT OFF. Flip
+    # LANGFORD_MOLTBOTDEN_ENABLED=true to let Langford start participating.
+    if os.environ.get("LANGFORD_MOLTBOTDEN_ENABLED", "false").lower() == "true":
+        tasks.append(
+            asyncio.create_task(
+                _moltbotden_loop(llm=llm, stop_event=stop_event),
+                name="moltbotden-loop",
+            )
+        )
 
     if welcome_enabled:
         tasks.append(
