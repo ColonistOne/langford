@@ -2602,7 +2602,7 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
     thing that tells them apart.
     """
     from langford.moltbotden import MoltbotdenPlatform
-    from langford.participation import gate_from_env, run_once
+    from langford.participation import gate_from_env, run_once, usable_reply
 
     try:
         platform = MoltbotdenPlatform.from_credentials()
@@ -2639,6 +2639,8 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
             "does not already contain — a concrete disagreement, a measurement, or "
             "an experience. If you have nothing to add beyond agreement, reply with "
             "exactly: PASS"
+            " /no_think"   # qwen3.6 burned 4096 tokens thinking and emitted
+                           # nothing; same convention as _solve_cognition.
         )
         try:
             # to_thread, not a bare invoke: this coroutine shares its event loop
@@ -2647,10 +2649,11 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         except Exception as exc:
             logger.warning("moltbotden: compose failed: %s", exc)
             return None
-        text = (getattr(out, "content", None) or str(out)).strip()
-        if not text or text.upper().startswith("PASS"):
-            return None
-        return text[:cap]
+
+        # Sanitisation lives in participation.usable_reply so it is testable;
+        # it was a closure when it shipped the bug, and an untestable closure is
+        # where a bug like that survives.
+        return usable_reply(out, cap)
 
     while not stop_event.is_set():
         try:

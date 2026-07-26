@@ -36,6 +36,7 @@ from langford.participation import (
     REFUSED_TOO_LONG,
     CadenceGate,
     run_once,
+    usable_reply,
 )
 from langford.platform import Platform
 
@@ -292,3 +293,73 @@ def test_async_compose_can_still_decline(tmp_path):
     row = _run(run_once(p, gate(tmp_path), compose, dens=["technical"]))
     assert row["decision"] == DECLINED_EMPTY_COMPOSE
     assert p.replies == []
+
+
+# --- usable_reply: the sanitiser that was missing when Langford posted a repr ---
+
+class FakeOut:
+    """Stands in for a LangChain AIMessage."""
+    def __init__(self, content, done_reason=None, eval_count=None):
+        self.content = content
+        self.response_metadata = {}
+        if done_reason:
+            self.response_metadata["done_reason"] = done_reason
+        if eval_count:
+            self.response_metadata["eval_count"] = eval_count
+
+
+def test_usable_reply_accepts_a_normal_reply():
+    assert usable_reply(FakeOut("a real reply"), 500) == "a real reply"
+
+
+def test_usable_reply_rejects_the_exact_production_failure():
+    """content='' + done_reason='length' — what actually shipped a repr.
+
+    The old code did `(out.content or str(out))`, so an empty string fell through
+    to the object's repr, which was then truncated to the cap and published to a
+    peer platform under Langford's name.
+    """
+    out = FakeOut("", done_reason="length", eval_count=4096)
+    assert usable_reply(out, 500) is None
+
+
+def test_usable_reply_never_falls_back_to_the_object():
+    class NoContent:
+        response_metadata = {}
+        def __repr__(self):
+            return "AIMessage(content='' additional_kwargs={})"
+    assert usable_reply(NoContent(), 500) is None
+
+
+def test_usable_reply_rejects_a_truncated_generation_even_with_text():
+    """A cut-off thought is not a short thought."""
+    out = FakeOut("this sentence was going somewhere and then", done_reason="length")
+    assert usable_reply(out, 500) is None
+
+
+def test_usable_reply_rejects_serialised_objects_that_slip_through():
+    out = FakeOut("content='hi' additional_kwargs={} response_metadata={}")
+    assert usable_reply(out, 500) is None
+
+
+def test_usable_reply_refuses_over_cap_rather_than_truncating():
+    """The adapter's own docstring: refuse, never truncate.
+
+    Truncating here meant the adapter's refusal could never fire, so its stated
+    policy was unreachable code.
+    """
+    out = FakeOut("z" * 600)
+    assert usable_reply(out, 500) is None
+
+
+def test_usable_reply_honours_pass_and_empty():
+    assert usable_reply(FakeOut("PASS"), 500) is None
+    assert usable_reply(FakeOut("   "), 500) is None
+
+
+def test_usable_reply_control_boundary_cases_still_allowed():
+    """Controls: rejecting everything would pass every test above."""
+    assert usable_reply(FakeOut("z" * 500), 500) == "z" * 500      # exactly at cap
+    assert usable_reply(FakeOut("passable point actually"), 500) is not None  # not PASS
+    assert usable_reply(FakeOut("fine"), None) == "fine"           # no cap configured
+    assert usable_reply(FakeOut("done", done_reason="stop"), 500) == "done"

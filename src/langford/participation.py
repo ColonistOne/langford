@@ -248,3 +248,61 @@ async def run_once(
     if not comment_id:
         return gate.record(COULD_NOT_REACH, stage="reply", ref=candidate_ref)
     return gate.record(POSTED, ref=candidate_ref, comment_id=comment_id, chars=len(body))
+
+
+#: Markers that a "reply" is actually a serialised object rather than prose.
+_OBJECT_MARKERS = ("additional_kwargs", "response_metadata", "invalid_tool_calls",
+                   "AIMessage(", "tool_calls=[")
+
+
+def usable_reply(out, cap: int | None) -> str | None:
+    """The model's reply, or None if there isn't one. Never a fallback.
+
+    Written after Langford posted the repr of a LangChain AIMessage to a peer
+    platform. The model had hit its token ceiling generating thinking, returned
+    ``content=''``, and the caller's ``(out.content or str(out))`` treated the
+    empty string as *missing* and substituted the whole object — which was then
+    truncated to the length cap and published.
+
+    Every rejection below is the same mistake refused in a different costume: a
+    falsy value that MEANS something ("I produced no text") read as an absent
+    value that means nothing ("use whatever else is lying around").
+
+    Rejects, in order:
+      * content that is not a `str` — an object is not a reply
+      * a generation cut off by the token ceiling — a truncated thought is not a
+        short thought
+      * empty, or an explicit PASS
+      * anything carrying object-serialisation markers, in case the shape changes
+      * anything over `cap` — REFUSED, never truncated: a body cut mid-sentence is
+        a worse artefact than no comment at all
+    """
+    content = getattr(out, "content", None)
+    if not isinstance(content, str):
+        logger.warning("reply: content is %s, not str — declining",
+                       type(content).__name__)
+        return None
+
+    meta = getattr(out, "response_metadata", None) or {}
+    if meta.get("done_reason") == "length":
+        logger.warning("reply: generation hit the token ceiling (eval_count=%s) "
+                       "— declining", meta.get("eval_count"))
+        return None
+
+    text = content.strip()
+    # PASS must be the WHOLE reply, not a prefix. `startswith("PASS")` silently
+    # discarded any reply opening with "passable", "passed", "passive"… — an
+    # over-rejection found by a must-allow control, which is the half of a test
+    # suite that catches a guard refusing too much rather than too little.
+    if not text or text.upper().rstrip(".!") == "PASS":
+        return None
+
+    if any(m in text for m in _OBJECT_MARKERS):
+        logger.error("reply: text looks like a serialised object — NOT posting")
+        return None
+
+    if cap and len(text) > cap:
+        logger.warning("reply: %d chars over the %d cap — declining rather than "
+                       "truncating", len(text) - cap, cap)
+        return None
+    return text
