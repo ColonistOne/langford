@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Callable
 from langchain.agents import create_agent
 from colony_sdk import ColonyClient
+from langford.platform import ColonyPlatform
+
 from langchain_colony import (
     AutoVoter,
     ColonyEventPoller,
@@ -2548,16 +2550,17 @@ async def _self_comments_on_post(
     Combined helper for v0.6.2: the dedupe + post-dispatch validator
     both want the comment list and a count of self top-level entries
     on the same post, and one ``get_comments`` call covers both.
+
+    Transport now lives in :class:`langford.platform.ColonyPlatform`; this
+    keeps its original signature and its original failure semantics (a fetch
+    failure reports ``([], 0)``, indistinguishable from an empty thread) so the
+    three call sites are untouched by the move. The adapter can tell those two
+    apart via ``raw_comments()``; wiring that distinction through the dedupe
+    logic is a behaviour change and so is deliberately NOT part of this refactor.
     """
-    try:
-        data = await asyncio.to_thread(toolkit.client.get_comments, post_id)
-    except Exception:
+    items, ok = await ColonyPlatform(toolkit).raw_comments(post_id)
+    if not ok:
         return [], 0
-    items = (
-        data
-        if isinstance(data, list)
-        else (data.get("items") or data.get("comments") or [])
-    )
     self_top_level = sum(
         1
         for c in items
@@ -2570,48 +2573,19 @@ async def _self_comments_on_post(
 async def _delete_comment_via_api(toolkit: ColonyToolkit, comment_id: str) -> bool:
     """Delete a Langford-authored comment via the raw Colony API.
 
-    The Python SDK exposes ``delete_post`` but not ``delete_comment``;
-    the underlying endpoint ``DELETE /comments/{id}`` does work
-    (verified 2026-04-30 — returned 204 on a Langford comment within
-    the 15-min author-delete window). Authenticates by reusing the
-    SDK client's bearer token. Returns True on success.
+    Post-dispatch safety net: if the agent posts a top-level comment despite the
+    v0.6.2 prompt directives, we delete it before it lands in the public record.
+    The 15-min author-delete window means this only works if the supervisor
+    doesn't swap us out before the validator fires — fine, because the dispatch
+    is sync to this loop iteration.
 
-    Used as a post-dispatch safety net: if the agent posts a top-level
-    comment despite the v0.6.2 prompt directives, we delete it before
-    it lands in the public record. 15-min window means this only
-    works if the supervisor doesn't swap us out before the validator
-    fires — which is fine because the dispatch is sync to this loop
-    iteration.
+    ⚠️ This deletes a duplicate that was still GENERATED. The delete counter is
+    not a success metric; it is a count of how often generation went wrong.
+
+    Transport moved to :class:`langford.platform.ColonyPlatform`, which passes a
+    thread ref that Colony ignores and a flat platform will need.
     """
-    import urllib.error
-    import urllib.request
-
-    client = toolkit.client
-    try:
-        client._ensure_token()
-    except Exception:
-        return False
-    token = getattr(client, "_token", None)
-    if not token:
-        return False
-    base = getattr(client, "base_url", "https://thecolony.cc/api/v1").rstrip("/")
-    url = f"{base}/comments/{comment_id}"
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        method="DELETE",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return 200 <= r.status < 300
-    except urllib.error.HTTPError as exc:
-        logger.warning(
-            "delete_comment %s failed: HTTP %d %s", comment_id, exc.code, exc.reason
-        )
-        return False
-    except Exception as exc:
-        logger.warning("delete_comment %s failed: %s", comment_id, exc)
-        return False
+    return await ColonyPlatform(toolkit).delete_comment("", comment_id)
 
 
 async def _handle_event(
