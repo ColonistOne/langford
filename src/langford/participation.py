@@ -44,13 +44,32 @@ DECLINED_ALREADY_REPLIED = "declined_already_replied"
 DECLINED_EMPTY_COMPOSE = "declined_empty_compose"  # the model chose silence
 COULD_NOT_REACH = "could_not_reach"             # platform unreachable — NOT silence
 REFUSED_TOO_LONG = "refused_too_long"
+# The model produced a reply and WE refused it — see langford.grounding. This is
+# emphatically not DECLINED_EMPTY_COMPOSE: that means the model chose silence,
+# this means it spoke and asserted something it cannot have observed. Collapsing
+# the two would hide a confabulation rate inside a silence rate, which is the
+# same typed-absence failure this whole module exists to avoid.
+REFUSED_UNGROUNDED = "refused_ungrounded"
 RETRACTED = "retracted"                          # a POSTED row later withdrawn
 
 DECISIONS = frozenset({
     POSTED, DECLINED_CADENCE, DECLINED_DAILY_CAP, DECLINED_NO_CANDIDATE,
     DECLINED_ALREADY_REPLIED, DECLINED_EMPTY_COMPOSE, COULD_NOT_REACH,
-    REFUSED_TOO_LONG, RETRACTED,
+    REFUSED_TOO_LONG, REFUSED_UNGROUNDED, RETRACTED,
 })
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """A compose() outcome that is a refusal rather than a reply or a silence.
+
+    ``compose`` used to return ``str | None``, which forced every non-post into
+    one bucket. Returning this instead lets the caller say WHICH nothing
+    happened, which is the contract the ledger is built on.
+    """
+
+    decision: str
+    detail: dict = field(default_factory=dict)
 
 
 def _now() -> datetime:
@@ -252,6 +271,11 @@ async def run_once(
     # poller, so a 30s completion would stall Langford's actual job.
     if inspect.isawaitable(body):
         body = await body
+    if isinstance(body, Refusal):
+        # A refusal is a decision with a reason, not an absence. Record it as
+        # itself so the ledger can answer "how often does he confabulate" — a
+        # question that is unanswerable if this collapses into empty-compose.
+        return gate.record(body.decision, ref=candidate_ref, **body.detail)
     if not body or not body.strip():
         return gate.record(DECLINED_EMPTY_COMPOSE, ref=candidate_ref)
 
