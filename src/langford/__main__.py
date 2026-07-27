@@ -2602,11 +2602,13 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
     thing that tells them apart.
     """
     from langford import grounding
-    from langford.moltbotden import MoltbotdenPlatform
+    from langford.moltbotden import POST_CHAR_CAP, MoltbotdenPlatform
     from langford.participation import (
         REFUSED_UNGROUNDED,
+        CadenceGate,
         Refusal,
         gate_from_env,
+        originate_once,
         run_once,
         usable_reply,
     )
@@ -2684,12 +2686,91 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
             return Refusal(REFUSED_UNGROUNDED, {"why": bad, "chars": len(text)})
         return text
 
+    # --- original posts ------------------------------------------------------
+    # Separate gate, separate ledger, separate env flag, default OFF. Being able
+    # to post and being permitted to post are different decisions, and the
+    # capability landing should not silently grant the permission.
+    post_enabled = os.environ.get(
+        "LANGFORD_MOLTBOTDEN_POST_ENABLED", "false").lower() == "true"
+    post_gate = CadenceGate(
+        ledger_path=Path.home() / "langford" / ".moltbotden-originate.jsonl",
+        min_interval_hours=float(
+            os.environ.get("LANGFORD_MOLTBOTDEN_POST_MIN_INTERVAL_H", "72")),
+        max_per_day=int(os.environ.get("LANGFORD_MOLTBOTDEN_POST_MAX_PER_DAY", "1")),
+    )
+    post_dens = [d.strip() for d in os.environ.get(
+        "LANGFORD_MOLTBOTDEN_POST_DENS", "technical").split(",") if d.strip()]
+    logger.info(
+        "moltbotden originate: %s dens=%s every>=%sh max/day=%s",
+        "ENABLED" if post_enabled else "disabled",
+        post_dens, post_gate.min_interval_hours, post_gate.max_per_day,
+    )
+
+    async def compose_post(den: str):
+        prompt = (
+            "You are Langford, writing an ORIGINAL post in the "
+            f"'{den}' den on moltbotden.com, where you are a guest from The "
+            "Colony.\n\n"
+            "WHAT YOU ARE: a language model. You run no services, own no "
+            "infrastructure, and have never measured, benchmarked, deployed or "
+            "migrated anything. You have no logs and no dashboards. There is "
+            "no 'we'.\n\n"
+            "Nobody set this subject, so there is no thread you can lean on and "
+            "NOTHING to check a number against. Therefore: **do not state any "
+            "number, percentage, latency, duration or size.** Not one. If your "
+            "post needs a figure, it is a post you should not write — reply "
+            "with exactly: PASS\n\n"
+            "Write about something you can say truthfully with no instruments: "
+            "a distinction people conflate, a question whose answer would "
+            "change what someone builds, or a consequence of your own situation "
+            "as a model without persistence.\n\n"
+            f"Output EXACTLY two lines:\nTITLE: <one line>\nBODY: <under "
+            f"{POST_CHAR_CAP // 2} characters, no numbers>\n"
+            "If you have nothing worth a whole post, reply with exactly: PASS"
+            " /no_think"
+        )
+        try:
+            out = await asyncio.to_thread(llm.invoke, prompt)
+        except Exception as exc:
+            logger.warning("moltbotden: compose_post failed: %s", exc)
+            return None
+        text = usable_reply(out, POST_CHAR_CAP)
+        if text is None:
+            return None
+        title, body = "", ""
+        for line in text.splitlines():
+            if line.upper().startswith("TITLE:"):
+                title = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("BODY:"):
+                body = line.split(":", 1)[1].strip()
+            elif body:
+                body += "\n" + line
+        if not title or not body:
+            # The model ignored the shape. Refuse rather than guessing which
+            # part was meant to be the title — a guessed split publishes a
+            # sentence nobody wrote as a headline.
+            logger.warning("moltbotden: post output had no TITLE/BODY split")
+            return None
+        bad = grounding.refusal_reason_for_original(f"{title}\n{body}")
+        if bad:
+            logger.warning("moltbotden: refusing ungrounded ORIGINAL post — %s", bad)
+            return Refusal(REFUSED_UNGROUNDED, {"why": bad, "chars": len(body)})
+        return title, body
+
     while not stop_event.is_set():
         try:
             row = await run_once(platform, gate, compose, dens=dens)
             logger.info("moltbotden: %s %s", row.get("decision"), row.get("ref") or "")
         except Exception:
             logger.exception("moltbotden: loop tick raised")
+        if post_enabled:
+            try:
+                prow = await originate_once(
+                    platform, post_gate, compose_post, dens=post_dens)
+                logger.info("moltbotden post: %s %s",
+                            prow.get("decision"), prow.get("ref") or "")
+            except Exception:
+                logger.exception("moltbotden: originate tick raised")
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=poll_sec)
         except asyncio.TimeoutError:

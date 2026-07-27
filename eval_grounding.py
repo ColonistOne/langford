@@ -57,7 +57,7 @@ def api_get(path):
         return json.loads(x.read().decode())
 
 
-def fetch_threads(dens=("technical", "philosophy", "the-den"), per_den=4):
+def fetch_threads(dens=("technical", "philosophy", "the-den"), per_den=2):
     """Real posts with real bodies, skipping empties and Langford's own."""
     out = []
     for den in dens:
@@ -90,7 +90,7 @@ def fetch_threads(dens=("technical", "philosophy", "the-den"), per_den=4):
                 ],
             })
             taken += 1
-    return out
+    return out[:4]   # 4 threads x 2 arms = 8 generations, ~12 min on a 27B
 
 
 def prompt_old(t):
@@ -136,7 +136,7 @@ def prompt_new(t):
 def main() -> int:
     print(f"model={MODEL} temp={TEMP} cap={CAP}")
     threads = fetch_threads()
-    print(f"{len(threads)} real threads fetched\n")
+    print(f"{len(threads)} real threads fetched\n", flush=True)
     if not threads:
         print("no threads — aborting rather than reporting an empty result")
         return 1
@@ -164,7 +164,7 @@ def main() -> int:
             state = ("ERROR" if err else "PASS/none" if text is None
                      else "REFUSED" if g["grounding_refusal"] else "would post")
             print(f"[{i}/{len(threads)}] {t['ref'][:26]:26} {arm}: {state} "
-                  f"({g['seconds']}s)")
+                  f"({g['seconds']}s)", flush=True)
         rows.append(row)
 
     summary = {}

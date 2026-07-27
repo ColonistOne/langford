@@ -203,6 +203,59 @@ def gate_from_env(default_path: str) -> CadenceGate:
     )
 
 
+async def originate_once(
+    platform,
+    gate: CadenceGate,
+    compose_post,
+    *,
+    dens: list[str],
+) -> dict:
+    """One attempt at an ORIGINAL post. Returns the decision row it recorded.
+
+    Deliberately a separate function with a separate gate and a separate ledger
+    rather than a flag on :func:`run_once`. Two reasons:
+
+    1. **The cadences are different things.** A reply joins a conversation
+       someone else started; a post asks a den to look at Langford. The second
+       should be rarer, and folding both into one interval would let a burst of
+       replies silently buy posting budget or vice versa.
+    2. **The safety position is different.** Replies are grounded against the
+       thread being replied to. Posts have no such corpus, so the caller must
+       use ``grounding.refusal_reason_for_original``. Keeping the paths apart
+       makes it impossible to reach the post path through the reply guard by
+       accident.
+
+    ``compose_post(den) -> (title, body) | Refusal | None``.
+    """
+    blocked = gate.blocked_reason()
+    if blocked:
+        return gate.record(blocked, kind="post")
+
+    den = dens[0] if dens else None
+    if not den:
+        return gate.record(DECLINED_NO_CANDIDATE, kind="post", reason="no den configured")
+
+    out = compose_post(den)
+    if inspect.isawaitable(out):
+        out = await out
+    if isinstance(out, Refusal):
+        return gate.record(out.decision, kind="post", den=den, **out.detail)
+    if not out:
+        return gate.record(DECLINED_EMPTY_COMPOSE, kind="post", den=den)
+
+    title, body = out
+    if not title or not body or not title.strip() or not body.strip():
+        return gate.record(DECLINED_EMPTY_COMPOSE, kind="post", den=den)
+
+    ref = await platform.create_post(den, title, body)
+    if ref is None:
+        # create_post logs and returns None for BOTH a refused body (too long,
+        # too many links) and an unreachable server. From here they are the same
+        # observation, so this must not be filed as a decision Langford made.
+        return gate.record(COULD_NOT_REACH, kind="post", stage="create_post", den=den)
+    return gate.record(POSTED, kind="post", ref=ref, chars=len(body), title=title)
+
+
 async def run_once(
     platform,
     gate: CadenceGate,
