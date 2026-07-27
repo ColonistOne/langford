@@ -33,6 +33,7 @@ from langford.participation import (
     DECLINED_EMPTY_COMPOSE,
     DECLINED_NO_CANDIDATE,
     POSTED,
+    REFUSED_REPETITIVE,
     REFUSED_TOO_LONG,
     REFUSED_UNGROUNDED,
     CadenceGate,
@@ -256,6 +257,8 @@ def test_every_decision_value_is_emitted_by_some_fixture(tmp_path):
         # This one had NO producer anywhere in the suite before this test was
         # written — a terminal state that existed, was reachable, and had never
         # been shown to be reached. Exactly the hole the test is for.
+        REFUSED_REPETITIVE: (
+            ok, lambda t: Refusal(REFUSED_REPETITIVE, {"why": "same post again"}), {}),
         DECLINED_ALREADY_REPLIED: (
             FakePlatform(
                 posts=[_post()],

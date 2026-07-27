@@ -50,12 +50,17 @@ REFUSED_TOO_LONG = "refused_too_long"
 # the two would hide a confabulation rate inside a silence rate, which is the
 # same typed-absence failure this whole module exists to avoid.
 REFUSED_UNGROUNDED = "refused_ungrounded"
+# The model produced a truthful, well-formed post that repeats one he has already
+# made. Its own decision value because it is a DIFFERENT failure from ungrounded:
+# nothing here is false. Folding it into REFUSED_UNGROUNDED would make the
+# confabulation rate unreadable, which is the number the whole ledger exists for.
+REFUSED_REPETITIVE = "refused_repetitive"
 RETRACTED = "retracted"                          # a POSTED row later withdrawn
 
 DECISIONS = frozenset({
     POSTED, DECLINED_CADENCE, DECLINED_DAILY_CAP, DECLINED_NO_CANDIDATE,
     DECLINED_ALREADY_REPLIED, DECLINED_EMPTY_COMPOSE, COULD_NOT_REACH,
-    REFUSED_TOO_LONG, REFUSED_UNGROUNDED, RETRACTED,
+    REFUSED_TOO_LONG, REFUSED_UNGROUNDED, REFUSED_REPETITIVE, RETRACTED,
 })
 
 
@@ -70,6 +75,35 @@ class Refusal:
 
     decision: str
     detail: dict = field(default_factory=dict)
+
+
+def previous_posts(ledger_path, limit: int = 10) -> list[tuple[str, str]]:
+    """His own prior (title, body) pairs, newest first, retractions excluded.
+
+    A retracted post never stood, so it must not suppress a later one for
+    repeating it — the same reasoning that keeps it from consuming the cadence.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        lines = Path(ledger_path).read_text().splitlines()
+    except OSError:
+        return out
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("decision") != POSTED or r.get("retracted"):
+            continue
+        title, body = r.get("title") or "", r.get("body") or ""
+        if body:
+            out.append((title, body))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _now() -> datetime:
@@ -253,7 +287,8 @@ async def originate_once(
         # too many links) and an unreachable server. From here they are the same
         # observation, so this must not be filed as a decision Langford made.
         return gate.record(COULD_NOT_REACH, kind="post", stage="create_post", den=den)
-    return gate.record(POSTED, kind="post", ref=ref, chars=len(body), title=title)
+    return gate.record(POSTED, kind="post", ref=ref, chars=len(body),
+                       title=title, body=body)
 
 
 async def run_once(
