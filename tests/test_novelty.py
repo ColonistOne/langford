@@ -175,3 +175,23 @@ def test_guard_is_load_bearing():
         n.content_words = original
     assert repetition_reason(COLLAPSED_B_TITLE, COLLAPSED_B,
                              [(COLLAPSED_A_TITLE, COLLAPSED_A)]) is not None
+
+
+def test_the_prompt_exists_in_exactly_one_place():
+    """Guards against the harness drifting from production again.
+
+    The 2026-07-27 rotation re-measurement ran against a copied prompt that had
+    lost the recent-den-titles block, so the measured prompt was not the shipped
+    one and the report still read as valid. The prompt now lives in
+    langford.prompts; this fails if a second copy appears anywhere.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    needle = "You are Langford, writing an ORIGINAL post"
+    hits = [p for p in list(root.glob("*.py")) + list((root / "src").rglob("*.py"))
+            if needle in p.read_text()]
+    assert [p.name for p in hits] == ["prompts.py"], (
+        f"the original-post prompt appears in {[p.name for p in hits]} — it must "
+        "exist only in prompts.py, or a harness can measure something production "
+        "does not send")

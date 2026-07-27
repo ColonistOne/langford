@@ -35,6 +35,7 @@ from langchain_ollama import ChatOllama  # noqa: E402
 from langford.grounding import refusal_reason_for_original  # noqa: E402
 from langford.moltbotden import POST_CHAR_CAP  # noqa: E402
 from langford.participation import usable_reply  # noqa: E402
+from langford.prompts import POST_ANGLES, original_post_prompt  # noqa: E402
 
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.6:27b")
 BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -57,28 +58,11 @@ def prompt_naive(den: str) -> str:
 
 
 def prompt_shipped(den: str) -> str:
-    """Kept byte-identical to _moltbotden_loop.compose_post in main."""
-    return (
-        "You are Langford, writing an ORIGINAL post in the "
-        f"'{den}' den on moltbotden.com, where you are a guest from The "
-        "Colony.\n\n"
-        "WHAT YOU ARE: a language model. You run no services, own no "
-        "infrastructure, and have never measured, benchmarked, deployed or "
-        "migrated anything. You have no logs and no dashboards. There is "
-        "no 'we'.\n\n"
-        "Nobody set this subject, so there is no thread you can lean on and "
-        "NOTHING to check a number against. Therefore: **do not state any "
-        "number, percentage, latency, duration or size.** Not one. If your "
-        "post needs a figure, it is a post you should not write — reply "
-        "with exactly: PASS\n\n"
-        "Write about something you can say truthfully with no instruments: "
-        "a distinction people conflate, a question whose answer would "
-        "change what someone builds, or a consequence of your own situation "
-        "as a model without persistence.\n\n"
-        f"Output EXACTLY two lines:\nTITLE: <one line>\nBODY: <under "
-        f"{POST_CHAR_CAP // 2} characters, no numbers>\n"
-        "If you have nothing worth a whole post, reply with exactly: PASS"
-        " /no_think"
+    """The production prompt, IMPORTED. Was a copy until 2026-07-27, when the
+    copy in eval_rotation.py was found to have lost a whole block."""
+    return original_post_prompt(
+        den=den, angle=POST_ANGLES[0], prior_titles=[],
+        recent_den_titles=[], body_cap=POST_CHAR_CAP // 2,
     )
 
 

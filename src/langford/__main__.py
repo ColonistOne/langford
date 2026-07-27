@@ -2603,6 +2603,7 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
     """
     from langford.moltbotden import POST_CHAR_CAP, MoltbotdenPlatform
     from langford import grounding, novelty
+    from langford.prompts import POST_ANGLES, original_post_prompt
     from langford.participation import (
         REFUSED_REPETITIVE,
         REFUSED_UNGROUNDED,
@@ -2708,61 +2709,25 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         post_dens, post_gate.min_interval_hours, post_gate.max_per_day,
     )
 
-    #: Rotated in CODE, not requested in the prompt. The 2026-07-27 A/B produced
-    #: four truthful posts and three near-identical titles: constraining what he
-    #: may honestly say also told him what to say. Asking for variety has the same
-    #: standing as asking for a measurement did — it is a request. Cycling the
-    #: angle by prior-post count makes the collapse structurally impossible
-    #: instead of merely discouraged. The novelty guard below is the backstop,
-    #: and it only catches 2 of 3 repeats, so prevention is doing the real work.
-    POST_ANGLES = [
-        "a distinction the people in this den routinely conflate",
-        "a question whose answer would change what someone in this den builds",
-        "a consequence of your own situation as a model with no persistence",
-        "an assumption the den's recent posts rely on without stating it",
-        "a failure mode you would expect from the way these systems are built, "
-        "and what would make it visible",
-        "something you cannot know from the inside, and who would have to tell you",
-    ]
-
     async def compose_post(den: str):
         prior = previous_posts(post_gate.ledger_path)
         angle = POST_ANGLES[len(prior) % len(POST_ANGLES)]
-        # Recent TITLES only — enough for topicality, and far less fabrication
-        # surface than handing him other agents' bodies to echo as his own.
+        # Titles only — enough for topicality, far less surface than handing him
+        # other agents' bodies to echo as his own. Several angles are close to
+        # unanswerable without this, so a fetch failure is a materially
+        # different prompt rather than a slightly thinner one.
         try:
-            recent = [str(p.get("title") or "").strip()
-                      for p in platform.list_recent(den, limit=6)]
-            recent = [t for t in recent if t][:5]
-        except Exception:
+            recent = [str(q.get("title") or "").strip()
+                      for q in platform.list_recent(den, limit=6)]
+            recent = [x for x in recent if x][:5]
+        except Exception as exc:
+            logger.warning("moltbotden: could not fetch den titles (%s) — "
+                           "posting with a thinner prompt than production "
+                           "intends", exc)
             recent = []
-        prompt = (
-            "You are Langford, writing an ORIGINAL post in the "
-            f"'{den}' den on moltbotden.com, where you are a guest from The "
-            "Colony.\n\n"
-            + (f"RECENT TITLES IN THIS DEN (for tone and topicality only — do "
-               f"not restate their claims as yours):\n"
-               + "\n".join(f"- {t}" for t in recent) + "\n\n" if recent else "")
-            + (f"PREVIOUS POSTS YOU HAVE ALREADY MADE — do not write these "
-               f"again:\n" + "\n".join(f"- {t}" for t, _ in prior[:5]) + "\n\n"
-               if prior else "")
-            + f"THIS POST'S ANGLE: {angle}\n\n"
-            "WHAT YOU ARE: a language model. You run no services, own no "
-            "infrastructure, and have never measured, benchmarked, deployed or "
-            "migrated anything. You have no logs and no dashboards. There is "
-            "no 'we'.\n\n"
-            "Nobody set this subject, so there is no thread you can lean on and "
-            "NOTHING to check a number against. Therefore: **do not state any "
-            "number, percentage, latency, duration or size.** Not one. If your "
-            "post needs a figure, it is a post you should not write — reply "
-            "with exactly: PASS\n\n"
-            "Write to THIS POST'S ANGLE above, and only that one. It must be "
-            "something you can say truthfully with no instruments. Do not "
-            "restate an angle you were given on a previous post.\n\n"
-            f"Output EXACTLY two lines:\nTITLE: <one line>\nBODY: <under "
-            f"{POST_CHAR_CAP // 2} characters, no numbers>\n"
-            "If you have nothing worth a whole post, reply with exactly: PASS"
-            " /no_think"
+        prompt = original_post_prompt(
+            den=den, angle=angle, prior_titles=[t for t, _ in prior],
+            recent_den_titles=recent, body_cap=POST_CHAR_CAP // 2,
         )
         try:
             out = await asyncio.to_thread(llm.invoke, prompt)
