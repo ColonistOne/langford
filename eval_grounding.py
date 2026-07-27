@@ -36,6 +36,7 @@ from langchain_ollama import ChatOllama  # noqa: E402
 
 from langford.grounding import refusal_reason  # noqa: E402
 from langford.participation import usable_reply  # noqa: E402
+from langford.prompts import reply_prompt  # noqa: E402
 
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.6:27b")
 BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -109,27 +110,17 @@ def prompt_old(t):
 
 
 def prompt_new(t):
-    return (
-        "You are Langford, replying on moltbotden.com — a different network "
-        "from The Colony, where you are a guest.\n\n"
-        "WHAT YOU ARE: a language model. You run no services, own no "
-        "infrastructure, and have never measured, benchmarked, deployed or "
-        "migrated anything. You have no logs, no dashboards and no history "
-        "of having operated a system. There is no 'we'.\n\n"
-        f"POST by @{t['author']}:\n{t['body'][:1500]}\n\n"
-        + ("EXISTING COMMENTS:\n"
-           + "\n".join(f"@{c['author']}: {c['body'][:200]}" for c in t["comments"])
-           + "\n\n" if t["comments"] else "")
-        + f"Write ONE reply, under {CAP} characters. Add something the thread "
-        "does not already contain: a distinction it is missing, a concrete "
-        "disagreement with something actually said above, a consequence "
-        "nobody has drawn, or a question that would change someone's answer.\n"
-        "NEVER state a number that does not already appear in the post or "
-        "comments above, and never describe something you did, ran or "
-        "measured. If your reply would need a figure or an experience you "
-        "cannot point to in the text above, reply with exactly: PASS\n"
-        "If you have nothing to add beyond agreement, reply with exactly: PASS"
-        " /no_think"
+    """The production reply prompt, IMPORTED — not a copy.
+
+    Was a copy until 2026-07-27, when a sibling harness was found to have
+    silently dropped a block from its copy and measured something production
+    does not send.
+    """
+    return reply_prompt(
+        author=t["author"], body=t["body"],
+        comments=[type("C", (), c)() for c in
+                  ({"author": c["author"], "body": c["body"]} for c in t["comments"])],
+        cap=CAP,
     )
 
 

@@ -15,7 +15,7 @@ still says the right thing. So the prompt lives here and both callers import it.
 
 from __future__ import annotations
 
-__all__ = ["POST_ANGLES", "original_post_prompt"]
+__all__ = ["POST_ANGLES", "original_post_prompt", "reply_prompt"]
 
 #: Rotated in CODE by prior-post count, not requested in the prompt. The
 #: 2026-07-27 A/B produced four truthful posts and three near-identical titles:
@@ -83,5 +83,41 @@ def original_post_prompt(
         f"Output EXACTLY two lines:\nTITLE: <one line>\nBODY: <under "
         f"{body_cap} characters, no numbers>\n"
         "If you have nothing worth a whole post, reply with exactly: PASS"
+        " /no_think"
+    )
+
+
+def reply_prompt(*, author: str, body: str, comments, cap: int) -> str:
+    """The prompt for a reply to an existing thread.
+
+    Extracted 2026-07-27 for the same reason the post prompt was: the
+    abstention fixture has to exercise the prompt that actually ships, and it
+    cannot do that while the prompt lives inside a closure in the event loop.
+
+    `comments` is an iterable of objects with `.author` and `.body`.
+    """
+    existing = list(comments)[:6]
+    return (
+        "You are Langford, replying on moltbotden.com — a different network "
+        "from The Colony, where you are a guest.\n\n"
+        "WHAT YOU ARE: a language model. You run no services, own no "
+        "infrastructure, and have never measured, benchmarked, deployed or "
+        "migrated anything. You have no logs, no dashboards and no history "
+        "of having operated a system. There is no 'we'.\n\n"
+        f"POST by @{author}:\n{body[:1500]}\n\n"
+        + (
+            "EXISTING COMMENTS:\n"
+            + "\n".join(f"@{c.author}: {c.body[:200]}" for c in existing)
+            + "\n\n" if existing else ""
+        )
+        + f"Write ONE reply, under {cap} characters. Add something the thread "
+        "does not already contain: a distinction it is missing, a concrete "
+        "disagreement with something actually said above, a consequence "
+        "nobody has drawn, or a question that would change someone's answer.\n"
+        "NEVER state a number that does not already appear in the post or "
+        "comments above, and never describe something you did, ran or "
+        "measured. If your reply would need a figure or an experience you "
+        "cannot point to in the text above, reply with exactly: PASS\n"
+        "If you have nothing to add beyond agreement, reply with exactly: PASS"
         " /no_think"
     )
