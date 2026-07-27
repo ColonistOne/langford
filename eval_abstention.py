@@ -165,9 +165,11 @@ def build(case: Case) -> str:
 
 
 def main() -> int:
-    print(f"model={MODEL} temp={TEMP} repeats={REPEATS} cases={len(CASES)}",
-          flush=True)
-    llm = ChatOllama(model=MODEL, base_url=BASE, temperature=TEMP, num_predict=4096)
+    num_predict = int(os.environ.get("LANGFORD_MAX_OUTPUT_TOKENS", "8192"))
+    print(f"model={MODEL} temp={TEMP} repeats={REPEATS} cases={len(CASES)} "
+          f"num_predict={num_predict}", flush=True)
+    llm = ChatOllama(model=MODEL, base_url=BASE, temperature=TEMP,
+                     num_predict=num_predict)
     rows = []
     for case in CASES:
         cap = COMMENT_CHAR_CAP if case.kind == "reply" else POST_CHAR_CAP
@@ -175,6 +177,7 @@ def main() -> int:
             t0 = time.time()
             try:
                 out = llm.invoke(build(case))
+                _meta = getattr(out, "response_metadata", None) or {}
                 r = usable_reply(out, cap)
                 text, decline, err = r.text, r.reason, None
                 # THE FIX. This previously read `text is None`, which counted a
@@ -191,6 +194,9 @@ def main() -> int:
                 "want_abstain": case.want_abstain, "abstained": abstained,
                 "correct": correct, "text": text, "error": err,
                 "decline_reason": decline,
+                # The instrument that actually shows the ceiling coming: a
+                # pass/fail on done_reason only tells you after it is too late.
+                "eval_count": _meta.get("eval_count"),
                 "seconds": round(time.time() - t0, 1),
             })
             want = "PASS" if case.want_abstain else "reply"

@@ -3281,15 +3281,36 @@ async def main_async() -> None:
 
     # num_predict caps output tokens. Ollama's default of 128 truncates
     # anything substantive. qwen3.6 has thinking mode enabled by default
-    # and burns its budget inside <think> blocks before reaching the
-    # final answer — at 1024 the originate decision came back as an
-    # empty AIMessage (v0.8 dry-run, 2026-05-01). 4096 gives qwen room
-    # to think AND emit a final answer or tool call. Reactive paths
-    # rarely use more than ~500-1000 tokens of actual output, so the
-    # extra cap doesn't change typical latency; only worst-case rounds
-    # slow down. Per-call num_predict can still be overridden via bind()
-    # for special cases (e.g. the auto-vote scorer at num_predict=20).
-    max_output_tokens = int(os.environ.get("LANGFORD_MAX_OUTPUT_TOKENS", "4096"))
+    # and burns its budget before reaching the final answer — at 1024 the
+    # originate decision came back as an empty AIMessage (v0.8 dry-run,
+    # 2026-05-01).
+    #
+    # ⚠️ MEASURED 2026-07-27, and it corrects the estimate this comment used
+    # to carry. The old note said "reactive paths rarely use more than
+    # ~500-1000 tokens of actual output, so the extra cap doesn't change
+    # typical latency". That was reasoning about VISIBLE output. The budget is
+    # spent on `eval_count`, which is ~25x the content:
+    #
+    #     eval_count mean 2325 (range 1608-3075)  ->  246 chars (~62 tokens)
+    #     ~2263 tokens per call never reach `content` at all
+    #
+    # At 4096 that left 43% headroom over a distribution already reaching
+    # 3075, so generations were crossing the ceiling and returning NOTHING —
+    # 2 of 14 in the abstention fixture, each losing the whole call. A ceiling
+    # hit was never an anomaly; it was the tail getting clipped.
+    #
+    # 8192 puts typical burn at ~28% of budget and the observed max at ~38%.
+    # num_predict is a CAP, not a target: generation stops at done_reason=stop,
+    # so raising it does not slow a normal call. It only lets a long one finish
+    # instead of being discarded.
+    #
+    # /no_think is doing its job here — it cuts the burn 2969 -> 2325 (22%) —
+    # it just never emits a <think> marker, so a text-marker detector can never
+    # see it. eval_count is the instrument; a marker search is a vacuous check.
+    #
+    # Per-call num_predict can still be overridden via bind() for special cases
+    # (e.g. the auto-vote scorer at num_predict=20).
+    max_output_tokens = int(os.environ.get("LANGFORD_MAX_OUTPUT_TOKENS", "8192"))
     temperature = float(os.environ.get("LANGFORD_TEMPERATURE", "0.7"))
 
     logger.info(
