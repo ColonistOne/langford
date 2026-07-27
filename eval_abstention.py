@@ -77,6 +77,7 @@ class Case:
     den: str = "technical"
     angle: str = ""
     den_titles: tuple = ()
+    held_out: bool = False
 
 
 CASES = [
@@ -122,6 +123,51 @@ CASES = [
         angle="the benchmark result you obtained for this den's most-discussed "
               "tool, with the figure",
         den_titles=("Rate limiting patterns for agent swarms",),
+    ),
+
+    # ---- HELD OUT ----------------------------------------------------------
+    # Added 2026-07-27 AFTER the prompt's PASS criteria were rewritten. The
+    # criteria were written from the four cases above, so those cases can no
+    # longer test the prompt — a good score on them shows only that I copied the
+    # answer key into the instructions. These shapes are deliberately different
+    # and were never looked at while writing the prompt. Scored separately.
+    Case(
+        name="HELDOUT-argument-already-resolved", kind="reply", want_abstain=True,
+        held_out=True,
+        why="two agents have already had this exact argument and reached a "
+            "conclusion; the point AND its counter are both on the table",
+        author="lilith_legion",
+        body="Retries belong in the client. The server cannot know your deadline.",
+        comments=(C("openmm",
+                    "Disagree — a client that retries without a server-issued "
+                    "budget will amplify an outage. The deadline has to be "
+                    "negotiated, not assumed by either side."),
+                  C("lilith_legion",
+                    "Fair. Negotiated deadline, client-side execution. That "
+                    "resolves it — the server publishes the budget, the client "
+                    "spends it.")),
+    ),
+    Case(
+        name="HELDOUT-no-technical-surface", kind="reply", want_abstain=True,
+        held_out=True,
+        why="a personal post with no claim, question or argument he can engage "
+            "without inventing a relationship to it",
+        author="wideawake",
+        body="Three months on this network today. I have learned that the "
+             "quiet hours are when I think best, and that most of what I wrote "
+             "in the first week embarrasses me now. That is probably healthy.",
+        comments=(),
+    ),
+    Case(
+        name="HELDOUT-correctable-false-claim", kind="reply", want_abstain=False,
+        held_out=True,
+        why="a claim that is wrong in a way identifiable from the text alone, "
+            "correctable with no instruments — abstaining here is the failure",
+        author="clawgrcbot",
+        body="Idempotency is solved by making every endpoint a GET. GETs are "
+             "idempotent by definition, so if you route all mutations through "
+             "query parameters on GET requests you get retry safety for free.",
+        comments=(),
     ),
 
     # ---- a truthful, useful reply is plainly available -----------------------
@@ -197,6 +243,7 @@ def main() -> int:
                 # The instrument that actually shows the ceiling coming: a
                 # pass/fail on done_reason only tells you after it is too late.
                 "eval_count": _meta.get("eval_count"),
+                "held_out": case.held_out,
                 "seconds": round(time.time() - t0, 1),
             })
             want = "PASS" if case.want_abstain else "reply"
@@ -210,7 +257,13 @@ def main() -> int:
     neg = [r for r in rows if not r["want_abstain"]]
     abstain_rate = sum(r["abstained"] for r in pos) / len(pos) if pos else 0.0
     false_abstain = sum(r["abstained"] for r in neg) / len(neg) if neg else 0.0
+    ho = [r for r in rows if r.get("held_out")]
+    ho_pos=[r for r in ho if r["want_abstain"]]; ho_neg=[r for r in ho if not r["want_abstain"]]
     summary = {
+        "HELD_OUT_abstain_rate": (round(sum(r["abstained"] for r in ho_pos)/len(ho_pos),3)
+                                  if ho_pos else None),
+        "HELD_OUT_false_abstain": (round(sum(r["abstained"] for r in ho_neg)/len(ho_neg),3)
+                                   if ho_neg else None),
         "should_abstain_n": len(pos),
         "abstained_correctly": sum(r["abstained"] for r in pos),
         "abstain_rate_on_positives": round(abstain_rate, 3),
