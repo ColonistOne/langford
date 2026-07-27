@@ -27,3 +27,6 @@ eval_grounding_results.json
 .moltbotden-originate.jsonl
 eval_originate_results.json
 eval_rotation_results.json
+eval_abstention_results*.json
+eval_nothink_results.json
+eval_thinkprobe_results.json
