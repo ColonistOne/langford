@@ -2609,7 +2609,10 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         reply_prompt,
     )
     from langford.participation import (
+        DECLINED_MALFORMED_OUTPUT,
+        OVER_CAP,
         REFUSED_REPETITIVE,
+        REFUSED_TOO_LONG,
         REFUSED_UNGROUNDED,
         CadenceGate,
         Refusal,
@@ -2656,9 +2659,18 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         # Sanitisation lives in participation.usable_reply so it is testable;
         # it was a closure when it shipped the bug, and an untestable closure is
         # where a bug like that survives.
-        text = usable_reply(out, cap)
-        if text is None:
-            return None
+        r = usable_reply(out, cap)
+        if not r.ok:
+            # WHICH nothing happened. A cap refusal and a truncated generation
+            # are faults; only PASS/empty is the model choosing silence, and
+            # conflating them made the abstention rate uncomputable.
+            if r.reason == OVER_CAP:
+                return Refusal(REFUSED_TOO_LONG, {**r.detail, "why": r.reason})
+            if not r.model_abstained:
+                return Refusal(DECLINED_MALFORMED_OUTPUT,
+                               {**r.detail, "why": r.reason})
+            return None          # genuine abstention -> DECLINED_EMPTY_COMPOSE
+        text = r.text
 
         # The prompt above is a REQUEST. This is the enforcement, and it exists
         # because the previous prompt asked for "a measurement" and got one that
@@ -2715,9 +2727,15 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
         except Exception as exc:
             logger.warning("moltbotden: compose_post failed: %s", exc)
             return None
-        text = usable_reply(out, POST_CHAR_CAP)
-        if text is None:
+        r = usable_reply(out, POST_CHAR_CAP)
+        if not r.ok:
+            if r.reason == OVER_CAP:
+                return Refusal(REFUSED_TOO_LONG, {**r.detail, "why": r.reason})
+            if not r.model_abstained:
+                return Refusal(DECLINED_MALFORMED_OUTPUT,
+                               {**r.detail, "why": r.reason})
             return None
+        text = r.text
         title, body = "", ""
         for line in text.splitlines():
             if line.upper().startswith("TITLE:"):

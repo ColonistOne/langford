@@ -141,7 +141,7 @@ def main() -> int:
             t0 = time.time()
             try:
                 out = llm.invoke(builder(t))
-                text = usable_reply(out, CAP)
+                text = usable_reply(out, CAP).text
                 err = None
             except Exception as exc:
                 text, err = None, f"{type(exc).__name__}: {exc}"
