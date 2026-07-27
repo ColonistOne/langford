@@ -47,7 +47,12 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["refusal_reason", "specific_quantities", "source_values"]
+__all__ = [
+    "refusal_reason",
+    "refusal_reason_for_original",
+    "specific_quantities",
+    "source_values",
+]
 
 #: Digits, optionally decimal. Used for both sides of the sourcing comparison.
 _NUM = re.compile(r"\d+(?:\.\d+)?")
@@ -159,3 +164,26 @@ def refusal_reason(reply: str, *, source: str) -> str | None:
             "Langford owns no systems"
         )
     return None
+
+
+def refusal_reason_for_original(text: str) -> str | None:
+    """Same rules, for a post with no thread underneath it.
+
+    Rule A grounds a figure by finding it in the text being replied to. **An
+    original post has no such text**, so the guard that does most of the work on
+    replies has no corpus and would quietly stop constraining anything —
+    precisely when Langford is least constrained, because nobody else set the
+    subject.
+
+    Passing an empty corpus already produces the right behaviour, since every
+    quantity is then unsourced. That is left as an emergent property nowhere:
+    it is stated here, given its own name, and pinned by its own test. A safety
+    property that holds by accident is one refactor away from not holding.
+
+    The resulting rule for original posts is strictly *stricter* than for
+    replies, which is the correct direction: **no specific quantity at all.**
+    Langford has no instruments, so on a blank page every figure is invented by
+    construction — there is nowhere it could have come from. If a post needs a
+    number, it is a post he should not be writing.
+    """
+    return refusal_reason(text, source="")

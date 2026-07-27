@@ -5,11 +5,20 @@ separate identity from his operator's, with its own key under
 ``/home/user/langford/`` and a guard hook that stops ColonistOne's tooling
 reaching it.
 
-**Reply-only by design.** No post creation here. Moltbotden's culture rewards
-commenting, new agents are rate-limited to 3 posts/day as "provisional", and the
-blast radius of a bad reply is smaller than a bad post. The absence of a
-``create_post`` method is the enforcement — nothing to call is stronger than a
-flag saying don't.
+**Reply-first, then posts.** The first pass was reply-only and the absence of a
+``create_post`` method *was* the enforcement — nothing to call being stronger
+than a flag saying don't. That held until replies had been measured rather than
+assumed (A/B, 2026-07-26: the old prompt confabulated telemetry 4/4, the new one
+0/4). ``create_post`` was added 2026-07-27 on the operator's instruction.
+
+⚠️ **Posting is not a bigger version of replying; it is a weaker safety
+position.** :func:`langford.grounding.refusal_reason` grounds every figure by
+finding it in the text being replied to. An original post has no such text, so
+the rule that does most of the work has no corpus exactly where Langford is
+least constrained — nobody else set the subject. Originals therefore go through
+:func:`langford.grounding.refusal_reason_for_original`, which is *stricter*: no
+specific quantity at all, because on a blank page every figure is invented by
+construction.
 
 Measured quirks, all of which cost something to learn:
 
@@ -37,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +68,16 @@ BROWSER_UA = (
 #: Documented cap. See the module docstring: observation says it may be larger,
 #: and we deliberately do not exploit that.
 COMMENT_CHAR_CAP = 500
+
+#: Server-side cap on an original post's body (422 `string_too_long` above it).
+POST_CHAR_CAP = 2000
+
+#: Moltbotden rejects link-heavy posts: three URLs returns 422 "Too many URLs.
+#: Please reduce link count."; one is known-safe, two is untested. Held at the
+#: measured-safe value rather than the guessed-tolerable one.
+POST_URL_CAP = 1
+
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 DEFAULT_CREDENTIALS = (
     "/home/user/langford/." + "moltbotden-langford/credentials." + "langford.json"
@@ -119,7 +139,7 @@ def _to_comment(raw: dict) -> Comment | None:
 
 
 class MoltbotdenPlatform:
-    """Reply-only :class:`Platform` for moltbotden.com."""
+    """:class:`Platform` for moltbotden.com — replies and original posts."""
 
     name = "moltbotden"
     supports_threading = True
@@ -242,6 +262,63 @@ class MoltbotdenPlatform:
             logger.warning("moltbotden: reply on %s failed: %s", ref, exc)
             return None
         return d.get("id") if isinstance(d, dict) else None
+
+    async def create_post(self, den: str, title: str, content: str) -> str | None:
+        """Create an original post in `den`; return its ref, or None on failure.
+
+        Deliberately absent from the first pass (reply-only, operator's call
+        2026-07-26). Added once replies were measured rather than assumed.
+
+        Two server-side caps bite here and neither is the comment cap:
+
+        * ``content`` must be <= POST_CHAR_CAP (2000) or the server answers 422
+          ``string_too_long``.
+        * There is a **URL-count limit**. Three links returns 422 "Too many
+          URLs"; one is known-safe. So a post gets at most one outbound link,
+          and this refuses rather than stripping — silently removing a link
+          changes what the author said.
+
+        Refuses rather than truncating, for the same reason ``reply`` does.
+        """
+        if len(content) > POST_CHAR_CAP:
+            logger.warning(
+                "moltbotden: refusing %d-char post (cap %d) in %s",
+                len(content), POST_CHAR_CAP, den,
+            )
+            return None
+        if not title.strip() or not content.strip():
+            logger.warning("moltbotden: refusing post with empty title or content")
+            return None
+        links = len(_URL_RE.findall(content))
+        if links > POST_URL_CAP:
+            logger.warning(
+                "moltbotden: refusing post with %d URLs (cap %d) — not stripping "
+                "them, since that would publish a claim nobody wrote",
+                links, POST_URL_CAP,
+            )
+            return None
+        try:
+            d = self._request(
+                "POST", f"/dens/{den}/posts", {"title": title, "content": content}
+            )
+        except MoltbotdenError as exc:
+            logger.warning("moltbotden: create_post in %s failed: %s", den, exc)
+            return None
+        if not isinstance(d, dict):
+            return None
+        post = d.get("post") if isinstance(d.get("post"), dict) else d
+        pid = post.get("id") if isinstance(post, dict) else None
+        return make_ref(den, pid) if isinstance(pid, str) and pid else None
+
+    async def delete_post(self, ref: str) -> bool:
+        """Withdraw an own post. Needed because retraction must be possible."""
+        den, post_id = split_ref(ref)
+        try:
+            self._request("DELETE", f"/dens/{den}/posts/{post_id}")
+        except MoltbotdenError as exc:
+            logger.warning("moltbotden: delete_post %s failed: %s", ref, exc)
+            return False
+        return True
 
     async def delete_comment(self, ref: str, comment_id: str) -> bool:
         den, post_id = split_ref(ref)
