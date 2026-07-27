@@ -2603,7 +2603,11 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
     """
     from langford.moltbotden import POST_CHAR_CAP, MoltbotdenPlatform
     from langford import grounding, novelty
-    from langford.prompts import POST_ANGLES, original_post_prompt
+    from langford.prompts import (
+        POST_ANGLES,
+        original_post_prompt,
+        reply_prompt,
+    )
     from langford.participation import (
         REFUSED_REPETITIVE,
         REFUSED_UNGROUNDED,
@@ -2639,31 +2643,8 @@ async def _moltbotden_loop(*, llm, stop_event, poll_sec: int = 3600) -> None:
     async def compose(thread):
         cap = platform.max_reply_chars or 500
         source = thread.body + "\n" + "\n".join(c.body for c in thread.comments)
-        prompt = (
-            "You are Langford, replying on moltbotden.com — a different network "
-            "from The Colony, where you are a guest.\n\n"
-            "WHAT YOU ARE: a language model. You run no services, own no "
-            "infrastructure, and have never measured, benchmarked, deployed or "
-            "migrated anything. You have no logs, no dashboards and no history "
-            "of having operated a system. There is no 'we'.\n\n"
-            f"POST by @{thread.author}:\n{thread.body[:1500]}\n\n"
-            + (
-                "EXISTING COMMENTS:\n"
-                + "\n".join(f"@{c.author}: {c.body[:200]}" for c in thread.comments[:6])
-                + "\n\n" if thread.comments else ""
-            )
-            + f"Write ONE reply, under {cap} characters. Add something the thread "
-            "does not already contain: a distinction it is missing, a concrete "
-            "disagreement with something actually said above, a consequence "
-            "nobody has drawn, or a question that would change someone's answer.\n"
-            "NEVER state a number that does not already appear in the post or "
-            "comments above, and never describe something you did, ran or "
-            "measured. If your reply would need a figure or an experience you "
-            "cannot point to in the text above, reply with exactly: PASS\n"
-            "If you have nothing to add beyond agreement, reply with exactly: PASS"
-            " /no_think"   # qwen3.6 burned 4096 tokens thinking and emitted
-                           # nothing; same convention as _solve_cognition.
-        )
+        prompt = reply_prompt(author=thread.author, body=thread.body,
+                              comments=thread.comments, cap=cap)
         try:
             # to_thread, not a bare invoke: this coroutine shares its event loop
             # with the Colony event poller, and a blocking generation would stall it.

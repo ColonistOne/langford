@@ -188,9 +188,21 @@ def test_the_prompt_exists_in_exactly_one_place():
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    needle = "You are Langford, writing an ORIGINAL post"
+    # eval_grounding.py holds the PRE-FIX reply prompt as a deliberate positive
+    # control. A control is supposed to differ from production — that is its
+    # whole function — so it is exempted by name rather than by widening the
+    # rule, and rewriting it to pass would falsify the historical record it is.
+    EXEMPT = {"eval_grounding.py"}
+    for needle in ("You are Langford, writing an ORIGINAL post",
+                   "You are Langford, replying on moltbotden"):
+        hits = [p for p in list(root.glob("*.py")) + list((root / "src").rglob("*.py"))
+                if needle in p.read_text() and p.name not in EXEMPT]
+        assert [p.name for p in hits] == ["prompts.py"], (
+            f"{needle!r} appears in {[p.name for p in hits]} — prompts must exist "
+            "only in prompts.py, or a harness can measure something production "
+            "does not send")
     hits = [p for p in list(root.glob("*.py")) + list((root / "src").rglob("*.py"))
-            if needle in p.read_text()]
+            if "You are Langford, writing an ORIGINAL post" in p.read_text()]
     assert [p.name for p in hits] == ["prompts.py"], (
         f"the original-post prompt appears in {[p.name for p in hits]} — it must "
         "exist only in prompts.py, or a harness can measure something production "

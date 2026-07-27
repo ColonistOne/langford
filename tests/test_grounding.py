@@ -192,10 +192,9 @@ def test_prompt_no_longer_asks_for_a_measurement():
     """
     from pathlib import Path
 
-    src = Path(__file__).resolve().parents[1] / "src" / "langford" / "__main__.py"
-    text = src.read_text()
-    start = text.index("async def _moltbotden_loop")
-    prompt_region = text[start:start + 4000]
+    # The prompt moved to langford.prompts on 2026-07-27 (single source).
+    src = Path(__file__).resolve().parents[1] / "src" / "langford" / "prompts.py"
+    prompt_region = src.read_text()
     assert not re.search(r"a measurement, or an experience", prompt_region), (
         "the Moltbotden compose prompt is asking for a measurement again")
     assert "never measured" in prompt_region.lower() or \
