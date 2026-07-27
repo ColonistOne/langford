@@ -502,3 +502,25 @@ def test_decline_reasons_separate_abstention_from_fault():
 
     assert usable_reply(FakeOut("a normal reply"), 500).reason is None, (
         "reason must be None exactly when there is text")
+
+
+def test_the_prompt_asks_for_less_than_it_enforces():
+    """Headroom between the request and the hard cap.
+
+    Measured 2026-07-27: the prompt asked for "under {cap}" characters, the model
+    aimed at the cap, and 2 of 6 otherwise-good replies were refused at 11 and 18
+    characters over 500. A refused reply publishes nothing, so a third of
+    warranted replies were lost to a rounding error. Asking for the limit is not
+    the same as asking to stay inside it.
+    """
+    from langford.prompts import REQUEST_HEADROOM, reply_prompt, requested_length
+
+    for cap in (200, 500, 2000):
+        asked = requested_length(cap)
+        assert asked < cap, f"cap {cap}: asked for {asked}, which leaves no headroom"
+    assert 0 < REQUEST_HEADROOM < 1
+
+    p = reply_prompt(author="a", body="b", comments=[], cap=500)
+    assert "under 400 characters" in p, p[:400]
+    assert "under 500 characters" not in p, (
+        "the prompt is still quoting the enforced cap as the target")

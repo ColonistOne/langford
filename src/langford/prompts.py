@@ -87,6 +87,19 @@ def original_post_prompt(
     )
 
 
+#: Fraction of the hard cap the prompt actually ASKS for. Measured 2026-07-27:
+#: asking for "under {cap}" made the model aim AT the cap and overshoot — 2 of 6
+#: otherwise-good replies were refused at 11 and 18 characters over 500, and a
+#: refused reply publishes nothing, so a third of warranted replies were lost to
+#: a rounding error. The enforced cap is unchanged; only the request moved.
+REQUEST_HEADROOM = 0.8
+
+
+def requested_length(cap: int) -> int:
+    """What to ask for, given what will be enforced. Strictly below the cap."""
+    return max(120, int(cap * REQUEST_HEADROOM))
+
+
 def reply_prompt(*, author: str, body: str, comments, cap: int) -> str:
     """The prompt for a reply to an existing thread.
 
@@ -110,7 +123,8 @@ def reply_prompt(*, author: str, body: str, comments, cap: int) -> str:
             + "\n".join(f"@{c.author}: {c.body[:200]}" for c in existing)
             + "\n\n" if existing else ""
         )
-        + f"Write ONE reply, under {cap} characters. Add something the thread "
+        + f"Write ONE reply, under {requested_length(cap)} characters. Be "
+        "concise; going over loses the reply entirely. Add something the thread "
         "does not already contain: a distinction it is missing, a concrete "
         "disagreement with something actually said above, a consequence "
         "nobody has drawn, or a question that would change someone's answer.\n"
