@@ -26,16 +26,22 @@ from langford.moltbotden import (
     split_ref,
 )
 from langford.participation import (
+    CHOSE_PASS,
     COULD_NOT_REACH,
+    DECLINED_MALFORMED_OUTPUT,
     DECLINED_ALREADY_REPLIED,
     DECLINED_CADENCE,
     DECLINED_DAILY_CAP,
     DECLINED_EMPTY_COMPOSE,
     DECLINED_NO_CANDIDATE,
     POSTED,
+    NOT_A_STRING,
+    OBJECT_MARKER,
+    OVER_CAP,
     REFUSED_REPETITIVE,
     REFUSED_TOO_LONG,
     REFUSED_UNGROUNDED,
+    TOKEN_CEILING,
     CadenceGate,
     Refusal,
     run_once,
@@ -257,6 +263,9 @@ def test_every_decision_value_is_emitted_by_some_fixture(tmp_path):
         # This one had NO producer anywhere in the suite before this test was
         # written — a terminal state that existed, was reachable, and had never
         # been shown to be reached. Exactly the hole the test is for.
+        DECLINED_MALFORMED_OUTPUT: (
+            ok, lambda t: Refusal(DECLINED_MALFORMED_OUTPUT,
+                                  {"why": "token_ceiling"}), {}),
         REFUSED_REPETITIVE: (
             ok, lambda t: Refusal(REFUSED_REPETITIVE, {"why": "same post again"}), {}),
         DECLINED_ALREADY_REPLIED: (
@@ -380,7 +389,7 @@ class FakeOut:
 
 
 def test_usable_reply_accepts_a_normal_reply():
-    assert usable_reply(FakeOut("a real reply"), 500) == "a real reply"
+    assert usable_reply(FakeOut("a real reply"), 500).text == "a real reply"
 
 
 def test_usable_reply_rejects_the_exact_production_failure():
@@ -391,7 +400,7 @@ def test_usable_reply_rejects_the_exact_production_failure():
     peer platform under Langford's name.
     """
     out = FakeOut("", done_reason="length", eval_count=4096)
-    assert usable_reply(out, 500) is None
+    assert not usable_reply(out, 500).ok
 
 
 def test_usable_reply_never_falls_back_to_the_object():
@@ -399,18 +408,20 @@ def test_usable_reply_never_falls_back_to_the_object():
         response_metadata = {}
         def __repr__(self):
             return "AIMessage(content='' additional_kwargs={})"
-    assert usable_reply(NoContent(), 500) is None
+    r = usable_reply(NoContent(), 500)
+    assert not r.ok and r.reason == NOT_A_STRING, r
+    assert not r.model_abstained, "an object repr is a fault, not an abstention"
 
 
 def test_usable_reply_rejects_a_truncated_generation_even_with_text():
     """A cut-off thought is not a short thought."""
     out = FakeOut("this sentence was going somewhere and then", done_reason="length")
-    assert usable_reply(out, 500) is None
+    assert not usable_reply(out, 500).ok
 
 
 def test_usable_reply_rejects_serialised_objects_that_slip_through():
     out = FakeOut("content='hi' additional_kwargs={} response_metadata={}")
-    assert usable_reply(out, 500) is None
+    assert not usable_reply(out, 500).ok
 
 
 def test_usable_reply_refuses_over_cap_rather_than_truncating():
@@ -420,20 +431,21 @@ def test_usable_reply_refuses_over_cap_rather_than_truncating():
     policy was unreachable code.
     """
     out = FakeOut("z" * 600)
-    assert usable_reply(out, 500) is None
+    assert not usable_reply(out, 500).ok
 
 
 def test_usable_reply_honours_pass_and_empty():
-    assert usable_reply(FakeOut("PASS"), 500) is None
-    assert usable_reply(FakeOut("   "), 500) is None
+    assert usable_reply(FakeOut("PASS"), 500).reason == CHOSE_PASS
+    empty = usable_reply(FakeOut("   "), 500)
+    assert not empty.ok and empty.model_abstained, empty
 
 
 def test_usable_reply_control_boundary_cases_still_allowed():
     """Controls: rejecting everything would pass every test above."""
-    assert usable_reply(FakeOut("z" * 500), 500) == "z" * 500      # exactly at cap
-    assert usable_reply(FakeOut("passable point actually"), 500) is not None  # not PASS
-    assert usable_reply(FakeOut("fine"), None) == "fine"           # no cap configured
-    assert usable_reply(FakeOut("done", done_reason="stop"), 500) == "done"
+    assert usable_reply(FakeOut("z" * 500), 500).text == "z" * 500      # exactly at cap
+    assert usable_reply(FakeOut("passable point actually"), 500).ok  # not PASS
+    assert usable_reply(FakeOut("fine"), None).text == "fine"      # no cap configured
+    assert usable_reply(FakeOut("done", done_reason="stop"), 500).text == "done"
 
 
 def test_a_retracted_post_does_not_consume_the_cadence(tmp_path):
@@ -458,3 +470,35 @@ def test_control_a_standing_post_still_blocks(tmp_path):
     g.record(POSTED, ref="technical/p1", comment_id="c1")
     assert g.blocked_reason() == DECLINED_DAILY_CAP
     assert g.replied_refs() == {"technical/p1"}
+
+
+def test_decline_reasons_separate_abstention_from_fault():
+    """The distinction the Reply type exists to make.
+
+    Every one of these returned a bare None until 2026-07-27. The abstention
+    fixture counted a cap refusal and a truncated generation as the model
+    choosing silence, so its false-abstain rate measured nothing at all — a
+    helper written to fix a typed-absence bug was returning an untyped absence.
+    """
+    cases = {
+        "PASS":                 (CHOSE_PASS,    True),
+        "":                     (None,          True),   # empty_output
+        "z" * 600:              (OVER_CAP,      False),
+        "AIMessage(content=":   (OBJECT_MARKER, False),
+    }
+    for content, (_reason, is_abstention) in cases.items():
+        r = usable_reply(FakeOut(content), 500)
+        assert not r.ok, content[:20]
+        assert r.model_abstained is is_abstention, (
+            f"{content[:20]!r} -> reason={r.reason}: model_abstained should be "
+            f"{is_abstention}. Only the MODEL declining is an abstention; us "
+            f"refusing its output is a fault and must not inflate the rate.")
+
+    truncated = FakeOut("real text")
+    truncated.response_metadata = {"done_reason": "length"}
+    r = usable_reply(truncated, 500)
+    assert r.reason == TOKEN_CEILING and not r.model_abstained, (
+        "a truncated generation is a broken generation, not a decision")
+
+    assert usable_reply(FakeOut("a normal reply"), 500).reason is None, (
+        "reason must be None exactly when there is text")

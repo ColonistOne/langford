@@ -102,16 +102,19 @@ def main() -> int:
         t0 = time.time()
         try:
             out = llm.invoke(build(DEN, angle, [t for t, _ in accepted]))
-            raw = usable_reply(out, POST_CHAR_CAP)
+            r = usable_reply(out, POST_CHAR_CAP)
+            raw, decline = r.text, r.reason
             err = None
         except Exception as exc:
-            raw, err = None, f"{type(exc).__name__}: {exc}"
+            raw, decline, err = None, None, f"{type(exc).__name__}: {exc}"
         title, body = split(raw) if raw else ("", "")
         grounding = (refusal_reason_for_original(f"{title}\n{body}")
                      if (title and body) else None)
         repetition = (repetition_reason(title, body, accepted)
                       if (title and body and not grounding) else None)
-        decision = ("error" if err else "abstained" if raw is None
+        decision = ("error" if err else
+                    ("abstained" if r.model_abstained else f"declined_{decline}")
+                    if raw is None
                     else "malformed" if not (title and body)
                     else "refused_ungrounded" if grounding
                     else "refused_repetitive" if repetition else "posted")

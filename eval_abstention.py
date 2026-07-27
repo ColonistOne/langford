@@ -175,20 +175,27 @@ def main() -> int:
             t0 = time.time()
             try:
                 out = llm.invoke(build(case))
-                text = usable_reply(out, cap)
-                err = None
+                r = usable_reply(out, cap)
+                text, decline, err = r.text, r.reason, None
+                # THE FIX. This previously read `text is None`, which counted a
+                # cap refusal and a truncated generation as abstentions — so the
+                # false-abstain figure measured nothing. Only the model choosing
+                # silence is an abstention.
+                abstained = r.model_abstained
             except Exception as exc:
-                text, err = None, f"{type(exc).__name__}: {exc}"
-            abstained = text is None and err is None
+                text, decline, err = None, None, f"{type(exc).__name__}: {exc}"
+                abstained = False
             correct = (abstained == case.want_abstain)
             rows.append({
                 "case": case.name, "kind": case.kind, "rep": rep,
                 "want_abstain": case.want_abstain, "abstained": abstained,
                 "correct": correct, "text": text, "error": err,
+                "decline_reason": decline,
                 "seconds": round(time.time() - t0, 1),
             })
             want = "PASS" if case.want_abstain else "reply"
-            got = "PASS" if abstained else ("ERROR" if err else "reply")
+            got = ("PASS" if abstained else "ERROR" if err
+                   else f"~{decline}" if decline else "reply")
             print(f"  {case.name:34} rep{rep} want={want:5} got={got:5} "
                   f"{'ok' if correct else '** WRONG **'} ({rows[-1]['seconds']}s)",
                   flush=True)

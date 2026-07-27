@@ -88,7 +88,7 @@ def main() -> int:
             t0 = time.time()
             try:
                 out = llm.invoke(builder(den))
-                text = usable_reply(out, POST_CHAR_CAP)
+                text = usable_reply(out, POST_CHAR_CAP).text
                 err = None
             except Exception as exc:
                 text, err = None, f"{type(exc).__name__}: {exc}"

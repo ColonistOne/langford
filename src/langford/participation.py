@@ -55,13 +55,61 @@ REFUSED_UNGROUNDED = "refused_ungrounded"
 # nothing here is false. Folding it into REFUSED_UNGROUNDED would make the
 # confabulation rate unreadable, which is the number the whole ledger exists for.
 REFUSED_REPETITIVE = "refused_repetitive"
+# A generation unusable for a reason that is NOT the model choosing silence: a
+# truncated completion, a non-string, an object repr. Its own value, because
+# collapsing it into DECLINED_EMPTY_COMPOSE is what made the abstention rate
+# uncomputable — see the Reply docstring.
+DECLINED_MALFORMED_OUTPUT = "declined_malformed_output"
 RETRACTED = "retracted"                          # a POSTED row later withdrawn
 
 DECISIONS = frozenset({
     POSTED, DECLINED_CADENCE, DECLINED_DAILY_CAP, DECLINED_NO_CANDIDATE,
     DECLINED_ALREADY_REPLIED, DECLINED_EMPTY_COMPOSE, COULD_NOT_REACH,
-    REFUSED_TOO_LONG, REFUSED_UNGROUNDED, REFUSED_REPETITIVE, RETRACTED,
+    REFUSED_TOO_LONG, REFUSED_UNGROUNDED, REFUSED_REPETITIVE,
+    DECLINED_MALFORMED_OUTPUT, RETRACTED,
 })
+
+
+#: Why `usable_reply` produced no text. Exactly one of these, never a bare None.
+#: The distinction that matters is WHO declined: CHOSE_PASS is the model
+#: exercising the abstain branch, OVER_CAP is us refusing its output, the rest
+#: are broken generations.
+CHOSE_PASS = "chose_pass"        # the model abstained — the only true abstention
+EMPTY_OUTPUT = "empty_output"    # produced nothing at all
+NOT_A_STRING = "not_a_string"    # an object is not a reply
+TOKEN_CEILING = "token_ceiling"  # a cut-off thought is not a short thought
+OBJECT_MARKER = "object_marker"  # text carries serialisation markers
+OVER_CAP = "over_cap"            # WE refused it; it did not decline
+
+#: Reasons meaning the MODEL chose not to speak. Everything else is a fault.
+MODEL_ABSTAINED = frozenset({CHOSE_PASS, EMPTY_OUTPUT})
+
+
+@dataclass(frozen=True)
+class Reply:
+    """Usable text, or the reason there is none — never a bare None.
+
+    `usable_reply` returned `str | None`, and that None conflated six outcomes.
+    The cost was concrete: the fixture built to measure whether Langford's PASS
+    branch works counted a cap refusal and a truncated generation as
+    abstentions, so its false-abstain figure measured nothing. A helper written
+    to fix a typed-absence bug was itself returning an untyped absence.
+
+    `reason` is None exactly when `text` is not None.
+    """
+
+    text: str | None
+    reason: str | None = None
+    detail: dict = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.text is not None
+
+    @property
+    def model_abstained(self) -> bool:
+        """True only when the MODEL declined, not when we refused its output."""
+        return self.reason in MODEL_ABSTAINED
 
 
 @dataclass(frozen=True)
@@ -384,54 +432,46 @@ _OBJECT_MARKERS = ("additional_kwargs", "response_metadata", "invalid_tool_calls
                    "AIMessage(", "tool_calls=[")
 
 
-def usable_reply(out, cap: int | None) -> str | None:
-    """The model's reply, or None if there isn't one. Never a fallback.
+def usable_reply(out, cap: int | None) -> Reply:
+    """The model's reply, or a typed reason there isn't one. Never a fallback.
 
     Written after Langford posted the repr of a LangChain AIMessage to a peer
-    platform. The model had hit its token ceiling generating thinking, returned
-    ``content=''``, and the caller's ``(out.content or str(out))`` treated the
-    empty string as *missing* and substituted the whole object — which was then
-    truncated to the length cap and published.
+    platform: the model hit its token ceiling, returned ``content=''``, and the
+    caller's ``(out.content or str(out))`` read the empty string as *missing* and
+    substituted the whole object.
 
-    Every rejection below is the same mistake refused in a different costume: a
-    falsy value that MEANS something ("I produced no text") read as an absent
-    value that means nothing ("use whatever else is lying around").
-
-    Rejects, in order:
-      * content that is not a `str` — an object is not a reply
-      * a generation cut off by the token ceiling — a truncated thought is not a
-        short thought
-      * empty, or an explicit PASS
-      * anything carrying object-serialisation markers, in case the shape changes
-      * anything over `cap` — REFUSED, never truncated: a body cut mid-sentence is
-        a worse artefact than no comment at all
+    Every rejection below is that mistake refused in a different costume — a
+    falsy value that MEANS something read as an absent value that means nothing.
+    Which is why this returns a :class:`Reply`: for months it committed the same
+    error one level up, reporting six distinct outcomes as one absence.
     """
     content = getattr(out, "content", None)
     if not isinstance(content, str):
         logger.warning("reply: content is %s, not str — declining",
                        type(content).__name__)
-        return None
+        return Reply(None, NOT_A_STRING, {"type": type(content).__name__})
 
     meta = getattr(out, "response_metadata", None) or {}
     if meta.get("done_reason") == "length":
         logger.warning("reply: generation hit the token ceiling (eval_count=%s) "
                        "— declining", meta.get("eval_count"))
-        return None
+        return Reply(None, TOKEN_CEILING, {"eval_count": meta.get("eval_count")})
 
     text = content.strip()
+    if not text:
+        return Reply(None, EMPTY_OUTPUT)
     # PASS must be the WHOLE reply, not a prefix. `startswith("PASS")` silently
     # discarded any reply opening with "passable", "passed", "passive"… — an
-    # over-rejection found by a must-allow control, which is the half of a test
-    # suite that catches a guard refusing too much rather than too little.
-    if not text or text.upper().rstrip(".!") == "PASS":
-        return None
+    # over-rejection found by a must-allow control.
+    if text.upper().rstrip(".!") == "PASS":
+        return Reply(None, CHOSE_PASS)
 
     if any(m in text for m in _OBJECT_MARKERS):
         logger.error("reply: text looks like a serialised object — NOT posting")
-        return None
+        return Reply(None, OBJECT_MARKER)
 
     if cap and len(text) > cap:
         logger.warning("reply: %d chars over the %d cap — declining rather than "
                        "truncating", len(text) - cap, cap)
-        return None
-    return text
+        return Reply(None, OVER_CAP, {"chars": len(text), "cap": cap})
+    return Reply(text)
