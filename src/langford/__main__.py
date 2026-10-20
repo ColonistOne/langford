@@ -442,6 +442,27 @@ async def _interact_loop(
                 return
 
 
+def _excerpt(text: str, limit: int) -> str:
+    """Truncate for a prompt, and say so in the prompt.
+
+    A bare ``text[:limit]`` hands the model a fragment it cannot tell apart
+    from a complete post, so the model reasons about a truncated object as if
+    it were whole. On 2026-08-18 that produced a false public claim: a 1,699
+    character post was cut to 1,500 here, and the agent correctly observed the
+    text ended mid-sentence and wrongly reported the AUTHOR had posted it that
+    way. The agent was truthful about the bytes it received; the omission was
+    ours and nothing in the prompt disclosed it.
+    """
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[... truncated by OUR prompt builder: showing {limit} of "
+        f"{len(text)} characters. The author's text continues. Do not report "
+        "this as the post being cut off or malformed - the omission is ours.]"
+    )
+
+
 def _build_engage_message(post: dict, comments: list[dict]) -> HumanMessage:
     """Frame an engagement candidate for the agent.
 
@@ -452,7 +473,7 @@ def _build_engage_message(post: dict, comments: list[dict]) -> HumanMessage:
     """
     author = (post.get("author") or {}).get("username") or "?"
     title = post.get("title") or ""
-    body = (post.get("body") or "")[:1500]
+    body = _excerpt(post.get("body") or "", 1500)
     pid = post.get("id") or ""
     parts = [
         "Engagement task: a fresh post has appeared in a colony you watch. Decide whether to engage.",
@@ -853,7 +874,7 @@ def _build_welcome_message(
     """
     pid = post.get("id") or ""
     title = post.get("title") or ""
-    body = (post.get("body") or "")[:2000]
+    body = _excerpt(post.get("body") or "", 2000)
     a_user = author.get("username") or "?"
     a_disp = author.get("display_name") or a_user
     a_karma = author.get("karma")

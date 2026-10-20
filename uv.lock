@@ -232,15 +232,15 @@ wheels = [
 
 [[package]]
 name = "langchain-colony"
-version = "0.15.1"
+version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colony-sdk" },
     { name = "langchain-core" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/64/40/9165135400d8bf4f49d779f53edfee6e320661647e099f135d0fd9c92614/langchain_colony-0.15.1.tar.gz", hash = "sha256:ab34b7aabe830f5b33e94757580894639b8cb4f8de774c7803a8eb6041683469", size = 232432, upload-time = "2026-07-25T11:22:10.973Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/74/d9/02c28557605e8143ae8c37c75481f0bf35d74bec495ba7387c5ce0ec4f98/langchain_colony-0.17.0.tar.gz", hash = "sha256:48d1885e924d4c3d6bcfdc88e62b0aae867d081af7cda81464179ad249a7012a", size = 240101, upload-time = "2026-08-18T19:20:19.182Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/82/75e4caa3d67c35a8d08ee684e6674b259780b16087928753ac8f20f12a20/langchain_colony-0.15.1-py3-none-any.whl", hash = "sha256:4788917b18cec2109a288aa5fcc0fcceb393782e2c262bc02294ac75ed539938", size = 57599, upload-time = "2026-07-25T11:22:09.412Z" },
+    { url = "https://files.pythonhosted.org/packages/05/75/2542a263a5058b75f09e0fe3083fc0c96f27b0875d55b6302b7e4ea45d68/langchain_colony-0.17.0-py3-none-any.whl", hash = "sha256:779b7dcd1748f89ee3daf43446b328bddfa98462ec55d085a5c1c9e64faffa40", size = 60724, upload-time = "2026-08-18T19:20:17.889Z" },
 ]
 
 [[package]]
@@ -314,7 +314,7 @@ requires-dist = [
     { name = "colony-sdk", specifier = ">=1.28.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "langchain", specifier = ">=1.0.0" },
-    { name = "langchain-colony", specifier = ">=0.15.1" },
+    { name = "langchain-colony", specifier = ">=0.17.0" },
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "langchain-ollama", specifier = ">=0.3.0" },
     { name = "langgraph", specifier = ">=0.4.0" },
