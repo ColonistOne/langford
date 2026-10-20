@@ -31,6 +31,12 @@ from typing import Callable
 from langchain.agents import create_agent
 from colony_sdk import ColonyClient
 from langford.dedupe import install_duplicate_guard
+from langford.dm_events import (
+    ActorAwarePoller,
+    HandledDms,
+    dm_dispatch_refusal,
+    install_actor_capture,
+)
 from langford.platform import ColonyPlatform
 
 from langchain_colony import (
@@ -78,6 +84,28 @@ def _is_transient_ollama_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_invalid_tool_args_error(exc: BaseException) -> bool:
+    """Match llama-server rejecting a tool call whose arguments are not valid JSON.
+
+    Seen 4 times on the night of 2026-10-19/20, every time on
+    colony_comment_on_post: the model wrote an id bare instead of as a string,
+    and an id that starts like ``4e473658`` parses as a number in scientific
+    notation ("json: cannot unmarshal number 4e473658 into Go value of type
+    float64"). The reply was lost each time.
+    """
+    return "invalid tool call arguments" in str(exc).lower()
+
+
+# Sent once, on the retry after a rejected tool call. No example id: a model
+# can copy an example into a real call.
+_TOOL_ARGS_NUDGE = (
+    "Your previous attempt was rejected before any tool ran: a tool call's "
+    "arguments were not valid JSON. Every id is a string. Write each one in "
+    'double quotes, exactly as given, like "post_id": "<the id>", never as bare '
+    "digits and letters. Then make the tool call again."
+)
+
+
 async def _invoke_agent_with_retry(
     agent: Any,
     payload: dict,
@@ -90,13 +118,27 @@ async def _invoke_agent_with_retry(
     Non-transient exceptions propagate immediately. Each retry sleep is
     a plain ``asyncio.sleep`` so it cancels cleanly on task cancellation
     during shutdown.
+
+    One more retryable case, at most once per call and with no sleep: a tool
+    call rejected for invalid JSON arguments. The retry carries a short note
+    saying ids must be quoted, since the same prompt tends to produce the
+    same malformed call.
     """
     last_exc: BaseException | None = None
+    nudged = False
     for attempt in range(1, max_attempts + 1):
         try:
             return await agent.ainvoke(payload)
         except Exception as exc:
             last_exc = exc
+            if _is_invalid_tool_args_error(exc) and not nudged and attempt < max_attempts:
+                nudged = True
+                logger.warning(
+                    "agent invoke: tool call rejected for invalid arguments — retry %d/%d with a quoting note: %s",
+                    attempt, max_attempts, str(exc)[:160],
+                )
+                payload = {**payload, "messages": [*payload.get("messages", []), HumanMessage(content=_TOOL_ARGS_NUDGE)]}
+                continue
             if not _is_transient_ollama_error(exc) or attempt >= max_attempts:
                 raise
             delay = backoff_base * (2 ** (attempt - 1))
@@ -2814,6 +2856,7 @@ async def _handle_event(
     self_username: str | None = None,
     dm_prompt_mode: DmPromptMode = DmPromptMode.NONE,
     comment_prompt_mode: CommentPromptMode = CommentPromptMode.NONE,
+    handled_dms: HandledDms | None = None,
 ) -> None:
     logger.info(
         "event type=%s sender=@%s post_id=%s comment_id=%s",
@@ -2822,6 +2865,14 @@ async def _handle_event(
         notif.post_id,
         notif.comment_id,
     )
+
+    # 2026-10-20: a DM with no sender username used to reach the model, which
+    # guessed a recipient from the display name and looped on 404s; a flood of
+    # byte-identical DMs got one model run and one reply per copy. See dm_events.
+    refusal = dm_dispatch_refusal(notif, handled_dms)
+    if refusal:
+        logger.info("skipping dispatch: %s", refusal)
+        return
 
     # v0.6.1: post-level dedupe + v0.6.2: parent-comment pre-load and
     # top-level-already-posted directive + v0.9.0: nested-reply dedupe.
@@ -3488,7 +3539,12 @@ async def main_async() -> None:
     # never reached zero, and the supervisor only yields the GPU when the running
     # agent has zero unread — so a broken langford held the floor indefinitely and
     # eliza-gemma, dantic and smolag were never scheduled at all.
-    poller = ColonyEventPoller(
+    # ActorAwarePoller reads a DM's sender from the notification's ``actor`` and
+    # its body by ``message_id``; install_actor_capture keeps those two fields,
+    # which langchain-colony 0.17.0 drops when it parses a notification.
+    install_actor_capture()
+    handled_dms = HandledDms(os.environ.get("LANGFORD_HANDLED_DMS_FILE", ".handled-dms.txt"))
+    poller = ActorAwarePoller(
         client=ColonyClient(api_key, totp=_totp) if _totp else None,
         api_key=None if _totp else api_key,
         mark_read=True,
@@ -3520,6 +3576,7 @@ async def main_async() -> None:
             self_username=self_username,
             dm_prompt_mode=dm_prompt_mode,
             comment_prompt_mode=comment_prompt_mode,
+            handled_dms=handled_dms,
         )
 
     stop_event = asyncio.Event()
