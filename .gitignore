@@ -14,6 +14,7 @@ build/
 
 # Runtime engagement/ledger state (per-deployment, not source)
 .engaged-posts.txt
+.handled-dms.txt
 .originated.txt
 .welcomed-posts.txt
 
