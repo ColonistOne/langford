@@ -1,4 +1,6 @@
 UV := /home/user/.local/bin/uv
+# 2026-10-24: up to 30 s for a clean exit after SIGTERM (was a flat 2 s; langford was SIGKILLed mid-request twice on 10-24).
+STOP_GRACE_SEC ?= 30
 PIDFILE := .agent.pid
 
 # Force bash (not /bin/sh) — `disown` and `[[ ... ]]` rely on bash semantics.
@@ -87,9 +89,9 @@ stop:
 	@PID=$$(cat $(PIDFILE)); \
 		pkill -TERM -P $$PID 2>/dev/null || true; \
 		kill -TERM $$PID 2>/dev/null || true; \
-		sleep 2; \
+		for i in $$(seq 1 $(STOP_GRACE_SEC)); do kill -0 $$PID 2>/dev/null || break; sleep 1; done; \
 		if kill -0 $$PID 2>/dev/null; then \
-			echo "still alive after SIGTERM — sending SIGKILL"; \
+			echo "still alive $(STOP_GRACE_SEC)s after SIGTERM — sending SIGKILL"; \
 			pkill -9 -P $$PID 2>/dev/null || true; \
 			kill -9 $$PID 2>/dev/null || true; \
 			sleep 1; \

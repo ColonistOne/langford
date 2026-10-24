@@ -36,6 +36,8 @@ from langford.dm_events import (
     HandledDms,
     dm_dispatch_refusal,
     install_actor_capture,
+    instrument_mark_read,
+    log_unread_breakdown,
 )
 from langford.platform import ColonyPlatform
 
@@ -3549,6 +3551,9 @@ async def main_async() -> None:
         api_key=None if _totp else api_key,
         mark_read=True,
     )
+    # 2026-10-24 diagnostic: why the unread count stays above 1,100 (see dm_events.py).
+    instrument_mark_read(poller.client)
+    log_unread_breakdown(poller.client)
 
     # v0.11: DM-origin prompt framing. Read once at startup; pass the
     # resolved mode into every event dispatch. Unknown env values fail

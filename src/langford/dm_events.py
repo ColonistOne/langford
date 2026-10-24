@@ -170,3 +170,66 @@ def dm_dispatch_refusal(notif: ColonyNotification, handled: HandledDms | None) -
             return f"identical DM from @{notif.sender_username} already handled"
         handled.record(notif.sender_username, text)
     return None
+
+
+# ── Unread-count diagnostic (2026-10-24) ─────────────────────────────────────
+#
+# The supervisor reads langford's unread notification count to decide whether
+# langford still has work. On 2026-10-24 it read 1,134 at 00:00 and 1,147 at
+# 02:44 BST, although the poller marks everything read after each new batch and
+# no "Failed to mark notifications read" warning was ever logged. So langford
+# ran to the 3,600 s ceiling every turn. These two hooks record what the count
+# does around each mark, and what the unread notifications are, so the cause
+# can be read from langford's own log. Reads only; they change nothing.
+
+
+def _unread_notification_count(client: Any) -> int | None:
+    try:
+        data = client.get_notification_count()
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never break the poll
+        logger.warning("notifications: get_notification_count failed: %s", exc)
+        return None
+    if isinstance(data, dict):
+        try:
+            return int(data.get("unread_count", 0))
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(data)
+    except (TypeError, ValueError):
+        return None
+
+
+def instrument_mark_read(client: Any) -> None:
+    """Wrap ``client.mark_notifications_read`` to log the unread count before and after it."""
+    original = client.mark_notifications_read
+
+    def mark_notifications_read(*args: Any, **kwargs: Any) -> Any:
+        before = _unread_notification_count(client)
+        result = original(*args, **kwargs)
+        after = _unread_notification_count(client)
+        logger.info("notifications: mark-all-read: unread %s -> %s", before, after)
+        if isinstance(after, int) and after > 0:
+            logger.warning("notifications: %d still unread straight after mark-all-read", after)
+        return result
+
+    client.mark_notifications_read = mark_notifications_read
+
+
+def log_unread_breakdown(client: Any, limit: int = 50) -> None:
+    """Log the unread total and the types of the newest unread notifications, once at startup."""
+    total = _unread_notification_count(client)
+    try:
+        rows = as_list(client.get_notifications(unread_only=True, limit=limit), "get_notifications")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("notifications: unread breakdown failed: %s", exc)
+        return
+    kinds: dict[str, int] = {}
+    for row in rows:
+        kind = str((row or {}).get("notification_type") or (row or {}).get("type") or "?") if isinstance(row, dict) else "?"
+        kinds[kind] = kinds.get(kind, 0) + 1
+    oldest = min((r.get("created_at") for r in rows if isinstance(r, dict) and r.get("created_at")), default=None)
+    logger.info(
+        "notifications: unread at startup %s; the newest %d unread rows by type: %s; oldest of them %s",
+        total, len(rows), ", ".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])) or "none", oldest,
+    )
